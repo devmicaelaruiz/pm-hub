@@ -4,7 +4,7 @@
    Web estática (GitHub Pages) + proxy Cloudflare Worker (Zendesk, Slack, IA)
    ===================================================================== */
 
-const VERSION = 'v1.2 · diagnóstico Slack';
+const VERSION = 'v1.5 · status, gantt y vistas';
 
 /* ---------- utilidades ---------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -40,6 +40,7 @@ const initials = n => String(n || '?').split(/\s+/).slice(0, 2).map(x => x[0]).j
 
 /* ---------- iconos ---------- */
 const ICONS = {
+  chart: '<line x1="4" y1="20" x2="20" y2="20"/><rect x="5" y="11" width="4" height="7"/><rect x="10" y="6" width="4" height="12"/><rect x="15" y="13" width="4" height="5"/>',
   layout: '<rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/>',
   check: '<polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
   table: '<rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="3" x2="9" y2="21"/>',
@@ -65,6 +66,7 @@ const ICONS = {
   mail: '<path d="M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/><polyline points="22,6 12,13 2,6"/>',
   up: '<polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>',
   logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>',
+  cal: '<rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>',
   down: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
 };
 const ic = (n, s = 16) => `<svg class="ic" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICONS[n] || ''}</svg>`;
@@ -93,10 +95,11 @@ function defaults() {
       workerUrl: '', pollSec: 60, slackPollSec: 120,
       keywords: 'evolutivo, deuda técnica, proyecto', internalDomains: 'inferencelabs9.com',
       myName: '', dailyTime: '17:30', staleDays: 2, leadMin: 60, replyHours: 4,
-      notif: true, includeSolved: false, syncKV: false,
+      notif: true, includeSolved: false, syncKV: false, autoDates: true, dateOwner: 'Giancarlo Guzmán',
+      areas: 'Tecnología, Operaciones, QA, Proyectos, Comercial, Cliente', provider: 'Inference Labs9',
     },
     folders: [{ id: 'f1', name: 'Mis dashboards', open: true, dashboards: [{ id: 'd1', name: 'Pendientes de respuesta', filters: { types: [], q: '', status: '', client: '', owner: '', slack: '', attention: true } }] }],
-    tickets: {}, archive: [], notifications: [], notified: {}, templates: defaultTemplates(), lastDaily: '', lastSync: 0,
+    tickets: {}, archive: [], clientCfg: {}, viewAll: null, notifications: [], notified: {}, templates: defaultTemplates(), lastDaily: '', lastSync: 0,
   };
 }
 const loadJSON = (k, def) => { try { const v = JSON.parse(localStorage.getItem(k)); return v || def; } catch { return def; } };
@@ -172,7 +175,7 @@ function parseJSON(txt) {
 
 /* ---------- sincronización opcional con KV ---------- */
 let kvT = null;
-const KV_KEYS = ['folders', 'tickets', 'archive', 'templates', 'notified', 'lastDaily'];
+const KV_KEYS = ['folders', 'tickets', 'archive', 'templates', 'notified', 'lastDaily', 'clientCfg', 'viewAll'];
 function kvSoon() { if (!S.settings.syncKV || !configured()) return; clearTimeout(kvT); kvT = setTimeout(kvPush, 120000); }
 async function kvPush(manual) {
   try {
@@ -249,19 +252,33 @@ function slackText(txt, users) {
     .replace(/<(https?:[^|>]+)\|([^>]+)>/g, '$2 ($1)').replace(/<(https?:[^>]+)>/g, '$1')
     .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 }
+/* Números que identifican un ticket: el ID de Zendesk y los que aparecen en el asunto (#4659, EVO 00087…) */
+function ticketNums(t) {
+  const out = [String(t.id)];
+  (String(t.subject || '').match(/\d{3,}/g) || []).forEach(n => {
+    if (/^(19|20)\d\d$/.test(n)) return;
+    [n, n.replace(/^0+/, '')].forEach(x => { if (x.length >= 3 && !out.includes(x)) out.push(x); });
+  });
+  return out;
+}
+function chanHasNum(c, n) {
+  const p = parseChan(c.name);
+  return (p && p.num === n) || String(c.name).split('-').includes(n);
+}
 function autoLink() {
   for (const t of Object.values(S.tickets)) {
     if (t.slackId || t.slackManualOff) continue;
     const used = new Set(Object.values(S.tickets).filter(x => x.slackId).map(x => x.slackId));
-    let ch = C.channels.find(c => { const p = parseChan(c.name); return p && p.num === t.id && !used.has(c.id); });
-    if (!ch) ch = C.channels.find(c => !used.has(c.id) && String(c.name).split('-').includes(String(t.id)));
-    if (ch) { t.slackId = ch.id; t.slackName = ch.name; t.slackAuto = true; }
+    for (const n of ticketNums(t)) {
+      const ch = C.channels.find(c => !used.has(c.id) && chanHasNum(c, n));
+      if (ch) { t.slackId = ch.id; t.slackName = ch.name; t.slackAuto = true; t.slackMatch = n; break; }
+    }
   }
 }
 function slackSuggestions(t) {
   const used = new Set(Object.values(S.tickets).filter(x => x.id !== t.id && x.slackId).map(x => x.slackId));
   const cn = norm(t.client);
-  const sc = c => { const p = parseChan(c.name) || {}; let s = 0; if (p.type === t.type) s += 1; if (p.client && cn.includes(norm(p.client))) s += 3; if (p.num === t.id) s += 9; if (!c.archived) s += 1; return s; };
+  const nums = ticketNums(t); const sc = c => { const p = parseChan(c.name) || {}; let s = 0; if (p.type === t.type) s += 1; if (p.client && cn.includes(norm(p.client))) s += 3; if (nums.some(n => chanHasNum(c, n))) s += 9; if (!c.archived) s += 1; return s; };
   return C.channels.filter(c => !used.has(c.id)).sort((a, b) => sc(b) - sc(a));
 }
 
@@ -349,16 +366,53 @@ function detectedFor(t) {
     .filter(i => !(t.converted || {})[i.key]).sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time)).slice(0, 14);
 }
 
+/* ---------- fechas de entrega e hitos (campos de fecha de Zendesk) ---------- */
+const dateVal = v => { const m = String(v || '').match(/^(\d{4}-\d{2}-\d{2})/); return m ? m[1] : ''; };
+function dateFieldsOf(t) {
+  return (t.fields || []).map(c => {
+    const f = fieldDef(c.id), d = dateVal(c.value);
+    return f && d && (f.type === 'date' || /^fecha/.test(norm(f.title))) ? { title: f.title.replace(/\*+$/, '').trim(), date: d } : null;
+  }).filter(Boolean);
+}
+function deliveryOf(t) {
+  if (t.deliveryManual) return { date: t.deliveryManual, src: 'manual' };
+  const p = dateFieldsOf(t).find(x => /entrega del proyecto|entrega al cliente|fecha de entrega$/.test(norm(x.title)));
+  return p ? { date: p.date, src: 'zendesk', title: p.title } : null;
+}
+const openTickets = () => Object.values(S.tickets).filter(t => !t.zdClosed);
+const missingDelivery = types => openTickets().filter(t => (!types.length || types.includes(t.type)) && !deliveryOf(t)).sort((a, b) => (a.client || '').localeCompare(b.client || '') || a.id - b.id);
+function askDateMessage(list) {
+  const first = (S.settings.dateOwner || 'Giancarlo').split(' ')[0];
+  return `Hola ${first}, ¿me ayudas con la fecha de entrega de estos proyectos? Aún no la tenemos registrada:\n\n${list.map(t => `- #${t.id} · ${t.client || '-'} · ${tplVars(t).asunto}`).join('\n')}\n\nGracias.`;
+}
+/* Convierte solas las fechas que aparecen en Zendesk/Slack en recordatorios */
+function autoDates(t) {
+  if (!S.settings.autoDates) return 0;
+  const today = isoDay(new Date()); let n = 0;
+  for (const d of detectedFor(t)) {
+    if (d.date < today) continue;
+    t.converted[d.key] = 1;
+    t.reminders.push({ id: uid(), text: trunc(d.snip, 130), due: d.time ? `${d.date}T${d.time}` : d.date, done: false, source: `auto · ${d.src}` });
+    n++;
+  }
+  return n;
+}
+
 /* ---------- alertas y notificaciones ---------- */
+let BURST = [];
 function alertOnce(key, tid, kind, text) {
   if (S.notified[key]) return;
   S.notified[key] = Date.now();
   S.notifications.unshift({ id: uid(), ts: Date.now(), tid: tid || '', kind, text, read: false });
   S.notifications = S.notifications.slice(0, 200);
-  toast(text);
-  if (S.settings.notif && 'Notification' in window && Notification.permission === 'granted') {
-    try { new Notification('PM Hub', { body: text }); } catch { }
+  const nt = Date.now(); BURST = BURST.filter(x => nt - x < 4000);
+  if (BURST.length < 3) {
+    toast(text);
+    if (S.settings.notif && 'Notification' in window && Notification.permission === 'granted') {
+      try { new Notification('PM Hub', { body: text }); } catch { }
+    }
   }
+  BURST.push(nt);
   for (const k of Object.keys(S.notified)) if (Date.now() - S.notified[k] > 40 * 864e5) delete S.notified[k];
   save(); updateBell();
 }
@@ -375,7 +429,17 @@ function tick() {
     if (t.readyToClose) alertOnce(`close:${t.id}`, t.id, 'cierre', `#${t.id} terminó (${t.zdClosed ? 'Zendesk cerrado' : 'canal de Slack archivado'}). Genera el resumen final y archívalo.`);
     (t.reminders || []).filter(r => !r.done && r.due).forEach(r => dueAlerts(t, r.text, r.due, 'rem:' + r.id, 'Recordatorio'));
     openSteps(t).filter(s => s.due).forEach(s => dueAlerts(t, s.text, s.due, 'step:' + s.id, s.type === 'pendiente' ? 'Pendiente' : 'Siguiente paso'));
+    (t.plan || []).filter(p => !p.done && (p.end || p.start)).forEach(p => dueAlerts(t, p.text, p.end || p.start, 'plan:' + p.id, KIND_LABEL[p.kind] || 'Plan'));
     if (t.zdClosed) continue;
+    const dv = deliveryOf(t);
+    if (dv) {
+      dueAlerts(t, t.subject, dv.date, `deliv:${t.id}:${dv.date}`, 'Entrega');
+      const dl = (parseDue(dv.date) - now) / 864e5;
+      if (dl > 1 && dl <= 7) alertOnce(`deliv7:${t.id}:${dv.date}`, t.id, 'vence', `#${t.id} · la entrega es el ${fmtDue(dv.date)} (en ${Math.ceil(dl)} días)`);
+    } else if (t.dateAsked) {
+      const dd = (Date.now() - t.dateAsked) / 864e5;
+      if (dd >= S.settings.staleDays) alertOnce(`dateask:${t.id}:${Math.floor(dd / S.settings.staleDays)}`, t.id, 'seguimiento', `#${t.id} · sigue sin fecha de entrega (se la pediste a ${S.settings.dateOwner} hace ${Math.floor(dd)} día(s))`);
+    }
     const l = lastPublic(t);
     if (l && l.side === 'cliente' && clientWaiting(t)) alertOnce(`reply:${t.id}:${l.id}`, t.id, 'responder', `#${t.id} · el cliente escribió (${l.author}) y aún no hay respuesta de Inference`);
     if (l && l.side === 'inference' && statusOf(t) === 'Esperando cliente') {
@@ -383,6 +447,8 @@ function tick() {
       if (days >= S.settings.staleDays) alertOnce(`stale:${t.id}:${l.id}:${Math.floor(days / S.settings.staleDays)}`, t.id, 'seguimiento', `#${t.id} · sin respuesta del cliente hace ${Math.floor(days)} día(s). Toca hacer seguimiento.`);
     }
   }
+  const nod = missingDelivery(['pry']).length;
+  if (nod) { const mon = new Date(now); mon.setDate(now.getDate() - ((now.getDay() + 6) % 7)); alertOnce('nodate:' + isoDay(mon), '', 'cal', `${nod} proyecto(s) sin fecha de entrega. Pídesela a ${S.settings.dateOwner} desde el Calendario.`); }
   const hhmm = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
   if (S.lastDaily !== isoDay(now) && hhmm >= S.settings.dailyTime && Object.keys(S.tickets).length) {
     S.lastDaily = isoDay(now);
@@ -456,6 +522,7 @@ async function refreshTicket(id, notify) {
   if (!t.client) t.client = clientFrom(d.ticket);
   t.zdClosed = ['solved', 'closed', 'deleted'].includes(d.ticket.status);
   t.readyToClose = t.zdClosed || !!t.slackArchived;
+  autoDates(t);
   if (notify && old.length && fresh.length) {
     const l = fresh[fresh.length - 1];
     alertOnce(`zd:${id}:${l.id}`, id, 'avance', `#${id} · ${l.side === 'cliente' ? 'Cliente' : 'Inference'} ${l.public ? 'respondió' : 'dejó nota interna'} (${l.author}): ${trunc(l.body, 90)}`);
@@ -494,6 +561,7 @@ async function refreshSlack(t) {
     alertOnce(`slack:${t.id}:${newest}`, t.id, 'avance', `Slack #${t.id} · ${fresh.length} mensaje(s) nuevo(s). ${l.user}: ${trunc(l.text, 90)}`);
   }
   t.lastSlackTs = newest; C.slack[t.id] = msgs.slice(-60);
+  autoDates(t);
   if (t.slackArchived) t.readyToClose = true;
 }
 async function syncAll() { await syncZendesk(); await syncSlack(); tick(); }
@@ -523,7 +591,7 @@ function ctxTicket(t, maxZ = 7000, maxS = 5000) {
   const reg = openSteps(t).map(x => `- (${x.type}, ${x.owner}${x.due ? ', vence ' + fmtDue(x.due) : ''}) ${x.text}`).join('\n') || '(ninguno)';
   return `TICKET #${t.id} (${TYPES[t.type]}) — ${t.subject}\nCliente: ${t.client || '?'} | Estado Zendesk: ${t.zdStatus} | Estado interno: ${statusOf(t)}\nPendientes ya registrados:\n${reg}\n\n=== ZENDESK (comentarios recientes; CLIENTE = lado del cliente, INFERENCE = nuestro equipo) ===\n${z || '(sin datos)'}\n=== SLACK interno del equipo (canal ${t.slackName || 'no vinculado'}) ===\n${s || '(sin datos)'}`;
 }
-const ITEM = '{"texto":"","responsable":"cliente|inference","vence":"YYYY-MM-DD o null"}';
+const ITEM = '{"texto":"","responsable":"cliente|inference","vence":"YYYY-MM-DD o null","area":"área que lo ejecuta o vacío","encargado":"persona encargada si se menciona o vacío"}';
 const SCHEMA_TICKET = `Esquema JSON: {"estado":"En Inference|Esperando cliente|Esperando proveedor|En pruebas|En espera|Bloqueado|Cerrado","resumen":"en qué estamos, máx 4 líneas","ultimo_avance":"qué cambió lo último","siguientes_pasos":[${ITEM}],"pendientes":[${ITEM}],"fechas":[{"fecha":"YYYY-MM-DD","hora":"HH:MM o null","texto":"qué ocurre ese día","fuente":"zendesk|slack"}],"alertas":["riesgos o cosas que requieren mi atención"],"respuestas":[{"titulo":"Breve","texto":"borrador de respuesta al cliente, sin firma"},{"titulo":"Formal","texto":""},{"titulo":"Pidiendo siguientes pasos","texto":""}]}. "siguientes_pasos" = acciones que vienen; "pendientes" = cosas abiertas que alguien debe entregar o resolver. Indica siempre quién es el responsable.`;
 const SCHEMA_MEET = `Esquema JSON: {"resumen":"resumen en 4-6 líneas","temas":["..."],"decisiones":["..."],"pendientes":[${ITEM}],"siguientes_pasos":[${ITEM}],"proxima_reunion":"fecha/hora si se mencionó, si no vacío","correo":"correo en texto plano para el cliente con saludo, resumen de lo visto, acuerdos, pendientes con responsable y fecha, próximos pasos y despedida, sin firma"}.`;
 
@@ -534,6 +602,12 @@ async function analyzeTicket(t, instruction) {
     const user = `Hoy es ${todayStr()}.\n\n${ctxTicket(t)}${extra ? '\n\n=== INFORMACIÓN EXTRA que pegó el PM ===\n' + extra.slice(0, 4000) : ''}\n\n${instruction ? 'Instrucción adicional del PM para las respuestas: ' + instruction + '\n\n' : ''}${SCHEMA_TICKET}`;
     const d = parseJSON(await ai(SYS, user));
     t.ai = { ts: Date.now(), data: d };
+    if (S.settings.autoDates) (d.fechas || []).forEach(f => {
+      const today = isoDay(new Date()), key = `ai|${f.fecha}|${f.hora || ''}|${norm(f.texto).slice(0, 24)}`;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(f.fecha)) || f.fecha < today || t.converted[key]) return;
+      t.converted[key] = 1;
+      t.reminders.push({ id: uid(), text: String(f.texto || 'Fecha detectada'), due: /^\d{2}:\d{2}$/.test(String(f.hora)) ? `${f.fecha}T${f.hora}` : f.fecha, done: false, source: 'auto · IA' });
+    });
     save();
   } catch (e) { toast('IA: ' + e.message, 'err'); }
   finally { UI.busy['ai' + t.id] = false; render(); }
@@ -656,11 +730,165 @@ function confirmArchive(tid) {
 }
 
 /* =====================================================================
+   v1.5 — Plan del proyecto (hitos, entregables, tareas), Status y calendario
+   ===================================================================== */
+const D1 = 864e5;
+const dIso = iso => new Date(iso + 'T00:00:00');
+const dDiff = (a, b) => Math.round((dIso(b) - dIso(a)) / D1);
+const daysTo = iso => dDiff(isoDay(new Date()), iso);
+const addDays = (iso, n) => { const d = dIso(iso); d.setDate(d.getDate() + n); return isoDay(d); };
+const cap = s => s ? s[0].toUpperCase() + s.slice(1) : s;
+const KIND_LABEL = { hito: 'Hito', entregable: 'Entregable', tarea: 'Tarea' };
+const areasList = () => String(S.settings.areas || '').split(',').map(s => s.trim()).filter(Boolean);
+
+function inferArea(title, kind) {
+  const s = norm(title);
+  if (/propuesta|comercial|orden de compra/.test(s)) return 'Comercial';
+  if (kind === 'entregable') return 'Proyectos';
+  if (/qa cliente|validacion|cliente/.test(s)) return 'Cliente';
+  if (/qa interno|prueba/.test(s)) return 'QA';
+  if (/desarroll|tecnolog|integracion|configuracion/.test(s)) return 'Tecnología';
+  return 'Proyectos';
+}
+function zdResp(t, base) {
+  const nb = norm(base);
+  for (const c of (t.fields || [])) {
+    const f = fieldDef(c.id);
+    if (f && c.value && norm(f.title).includes('responsable') && norm(f.title).includes(nb)) { const v = fieldLabel(f, c.value); return v === '-' ? '' : String(v); }
+  }
+  return '';
+}
+/* Hitos y entregables que salen de los campos de fecha de Zendesk */
+function zdItems(t) {
+  const out = [], groups = {}, dv = deliveryOf(t);
+  for (const x of dateFieldsOf(t)) {
+    const m = norm(x.title).match(/^(.*?)\s*-?\s*fecha\s+(inicio|fin)$/);
+    if (m && m[1].trim()) {
+      const key = m[1].trim(), g = groups[key] = groups[key] || { title: x.title.replace(/\s*[-–]?\s*fecha\s+(inicio|fin)\s*$/i, '').trim() };
+      g[m[2]] = x.date;
+      continue;
+    }
+    const kind = /^fecha de entrega/.test(norm(x.title)) ? 'entregable' : 'hito';
+    const title = kind === 'entregable' ? (cap(x.title.replace(/^fecha de entrega( de(l)?)?\s*/i, '').trim()) || 'Entrega') : cap(x.title.replace(/^fecha de\s+/i, '').trim());
+    out.push({ id: `zd:${t.id}:${norm(x.title)}`, kind, title, start: x.date, end: x.date, area: inferArea(title, kind), who: '', done: false, src: 'zendesk', main: !!(dv && dv.src === 'zendesk' && dv.title === x.title) });
+  }
+  for (const [key, g] of Object.entries(groups)) {
+    const s = g.inicio || g.fin, e = g.fin || g.inicio;
+    out.push({ id: `zd:${t.id}:${key}`, kind: 'hito', title: g.title, start: s, end: e, area: inferArea(g.title, 'hito'), who: zdResp(t, g.title), done: false, src: 'zendesk' });
+  }
+  return out;
+}
+/* Lista unificada: Zendesk + plan manual + pasos de Seguimiento con fecha */
+function ticketItems(t) {
+  const out = zdItems(t), dv = deliveryOf(t);
+  if (dv && dv.src === 'manual') out.push({ id: 'man:' + t.id, kind: 'entregable', title: 'Entrega al cliente', start: dv.date, end: dv.date, area: 'Proyectos', who: '', done: false, src: 'manual', main: true });
+  (t.plan || []).forEach(p => out.push({ id: p.id, kind: p.kind, title: p.text, start: p.start || p.end, end: p.end || p.start, area: p.area || '', who: p.who || '', done: !!p.done, src: 'plan' }));
+  (t.steps || []).forEach(s => {
+    if (!s.due) return;
+    const e = s.due.slice(0, 10);
+    out.push({ id: s.id, kind: 'tarea', title: s.text, start: (s.start || e).slice(0, 10), end: e, area: s.area || '', who: s.who || '', done: !!s.done, src: 'paso', owner: s.owner });
+  });
+  return out.filter(i => i.start && i.end).map(i => ({ ...i, t, start: i.start > i.end ? i.end : i.start }));
+}
+function itemState(i) {
+  const td = isoDay(new Date());
+  if (i.done) return 'Hecho';
+  if (i.end < td) return i.src === 'zendesk' ? 'Pasado' : 'Vencido';
+  if (i.start <= td) return i.start === i.end ? 'Hoy' : 'En curso';
+  return 'Próximo';
+}
+const allItems = list => (list || Object.values(S.tickets)).flatMap(ticketItems);
+function allAreas() { const s = new Set(areasList()); allItems().forEach(i => i.area && s.add(i.area)); return [...s]; }
+function allWho() { const s = new Set(); allItems().forEach(i => i.who && s.add(i.who)); return [...s].sort((a, b) => a.localeCompare(b)); }
+function whoSuggestions() {
+  const s = new Set();
+  for (const t of Object.values(S.tickets)) { (t.steps || []).forEach(x => x.who && s.add(x.who)); (t.plan || []).forEach(x => x.who && s.add(x.who)); zdItems(t).forEach(x => x.who && s.add(x.who)); }
+  return [...s].sort((a, b) => a.localeCompare(b));
+}
+
+/* ---------- calendario: eventos con área y encargado ---------- */
+const KORD = { entrega: 0, entregable: 1, hito: 2, tarea: 3, rem: 4 };
+const calMissTypes = () => UI.cal.types.length ? UI.cal.types : ['pry'];
+function calEvents(f) {
+  const ev = [];
+  for (const t of openTickets()) {
+    if (f.types.length && !f.types.includes(t.type)) continue;
+    for (const i of ticketItems(t)) {
+      if (f.area && i.area !== f.area) continue;
+      if (f.who && i.who !== f.who) continue;
+      if (i.done) continue;
+      const kind = i.main ? 'entrega' : i.kind;
+      if (kind === 'tarea' && !f.tareas) continue;
+      if ((kind === 'hito' || kind === 'entregable') && !f.hitos) continue;
+      const base = { t, kind, area: i.area, who: i.who, item: i };
+      if (i.start === i.end) ev.push({ ...base, date: i.end, label: kind === 'entrega' ? 'Entrega' : i.title });
+      else { ev.push({ ...base, date: i.start, label: 'Inicio · ' + i.title }); ev.push({ ...base, date: i.end, label: 'Fin · ' + i.title }); }
+    }
+    if (f.rem && !f.area && !f.who) (t.reminders || []).filter(r => !r.done && r.due).forEach(r => ev.push({ t, kind: 'rem', date: r.due.slice(0, 10), label: r.text, area: '', who: '' }));
+  }
+  return ev;
+}
+
+/* ---------- Status por cliente ---------- */
+const REP_STATES = [['En producción', '#2e9e5b'], ['En desarrollo', '#f08c00'], ['En evaluación', '#e6c200'], ['Bloqueado', '#d64545'], ['Cerrado', '#7d8791'], ['Finalizado', '#7a4fd1']];
+const repColor = s => (REP_STATES.find(x => x[0] === s) || [0, '#999'])[1];
+const repOf = t => t.rep = t.rep || { estado: '', area: '', resp: '', hEst: '', hours: {}, sit: '', next: '' };
+const cfgGet = c => S.clientCfg[c] || { bolsa: '', plataforma: '' };
+const cfgOf = c => S.clientCfg[c] = S.clientCfg[c] || { bolsa: '', plataforma: '' };
+const fmtH = n => `${Math.round((+n || 0) * 10) / 10}`.replace('.', ',') + ' h';
+function zdFieldVal(t, re) {
+  for (const c of (t.fields || [])) { const f = fieldDef(c.id); if (f && c.value && re.test(norm(f.title))) { const v = fieldLabel(f, c.value); if (v && v !== '-') return String(v); } }
+  return '';
+}
+function zdHours(t) {
+  let n = 0, any = false;
+  for (const c of (t.fields || [])) { const f = fieldDef(c.id); if (f && /horas de esfuerzo/.test(norm(f.title))) { const v = parseFloat(c.value); if (!isNaN(v)) { n += v; any = true; } } }
+  return any ? n : null;
+}
+function repHoursEst(t) { const r = repOf(t); if (r.hEst !== '' && r.hEst != null) return r.hEst; const z = zdHours(t); return z === null ? '' : z; }
+function repDerived(t) {
+  const ns = nextStep(t), a = t.ai && t.ai.data;
+  return {
+    area: zdFieldVal(t, /^producto/) || zdFieldVal(t, /^area del cliente/),
+    resp: ns ? (ns.owner === 'cliente' ? (t.client || 'Cliente') : (S.settings.provider || 'Inference')) : '',
+    sit: a && a.resumen ? trunc(a.resumen, 240) : '',
+    next: ns ? `${ns.text}${ns.due ? ` (${fmtDue(ns.due)})` : ''}` : '',
+  };
+}
+function repEstado(t) {
+  const r = repOf(t); if (r.estado) return r.estado;
+  const st = statusOf(t);
+  if (t.zdClosed || st === 'Cerrado') return 'Finalizado';
+  if (st === 'Bloqueado') return 'Bloqueado';
+  if (st === 'En pruebas') return 'En desarrollo';
+  const dev = zdItems(t).find(i => /desarroll/.test(norm(i.title)));
+  if (dev && dev.start <= isoDay(new Date())) return 'En desarrollo';
+  return 'En evaluación';
+}
+function statusClients() { return [...new Set(Object.values(S.tickets).map(t => t.client).filter(Boolean))].sort((a, b) => a.localeCompare(b)); }
+function statusList() {
+  const s = UI.st, clients = statusClients(), cl = s.client || clients[0] || '*';
+  let list = Object.values(S.tickets).filter(t => cl === '*' || (cl === '__none__' ? !t.client : norm(t.client) === norm(cl)));
+  if (!s.closed) list = list.filter(t => !t.zdClosed);
+  if (s.types.length) list = list.filter(t => s.types.includes(t.type));
+  return { cl, list: list.sort((a, b) => (+a.id) - (+b.id)) };
+}
+
+/* ---------- usuarios: contraseña aleatoria ---------- */
+function genPass(n = 20) {
+  const a = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789', r = new Uint32Array(n);
+  crypto.getRandomValues(r);
+  return [...r].map(x => a[x % a.length]).join('');
+}
+
+/* =====================================================================
    VISTAS
    ===================================================================== */
 const UI = {
   route: { v: 'dash', id: 'all' }, tabs: [], tab: {}, tpl: {}, extra: {}, busy: {}, sync: '', err: '', bell: false,
   fAll: { types: [], q: '', status: '', client: '', owner: '', slack: '', attention: false },
+  cal: { y: new Date().getFullYear(), m: new Date().getMonth(), types: [], hitos: true, tareas: true, rem: false, area: '', who: '' },
+  st: { client: '', month: isoDay(new Date()).slice(0, 7), date: isoDay(new Date()), types: [], closed: false, edit: false }, gz: 1, nu: { user: '', pass: '' },
   loginMsg: '', loginForm: { url: '', user: '' },
   daily: { scope: 'all' }, pend: { owner: '', type: '', overdue: false }, tplEdit: null, forceMeta: false,
 };
@@ -693,6 +921,7 @@ function render() {
   const sc = $('.view') ? $('.view').scrollTop : 0, tb = $('.tk-body') ? $('.tk-body').scrollTop : 0;
   $('#app').innerHTML = railHTML() + `<div class="main">${tabsHTML()}<div class="view">${viewHTML()}</div></div>` + (UI.bell ? bellHTML() : '');
   const v = $('.view'); if (v) v.scrollTop = sc; const b = $('.tk-body'); if (b) b.scrollTop = tb;
+  const g = $('.gantt'); if (g && g.dataset.today && !g.dataset.done) { g.dataset.done = 1; g.scrollLeft = Math.max(0, +g.dataset.today - 420); }
   updateBell();
 }
 
@@ -701,7 +930,7 @@ function railHTML() {
   const r = UI.route.v;
   const b = (v, icon, title) => `<button class="${r === v ? 'on' : ''}" data-act="nav" data-v="${v}" title="${title}">${ic(icon, 20)}</button>`;
   return `<nav class="rail"><div class="logo">PM</div>
-    ${b('dash', 'layout', 'Dashboards')}${b('pending', 'check', 'Pendientes y siguientes pasos')}${b('daily', 'table', 'Update del día')}${b('templates', 'file', 'Plantillas')}${b('archive', 'archive', 'Archivo de cierres')}
+    ${b('dash', 'layout', 'Dashboards')}${b('status', 'chart', 'Status por cliente')}${b('cal', 'cal', 'Calendario: entregas, hitos y tareas')}${b('pending', 'check', 'Pendientes y siguientes pasos')}${b('daily', 'table', 'Update del día')}${b('templates', 'file', 'Plantillas')}${b('archive', 'archive', 'Archivo de cierres')}
     <div class="sp"></div>
     <button data-act="bell" title="Notificaciones">${ic('bell', 20)}<span class="dot" id="bellCount" style="display:none">0</span></button>
     ${b('settings', 'settings', 'Ajustes')}<button data-act="logout" title="Cerrar sesión">${ic('logout', 20)}</button></nav>`;
@@ -718,13 +947,15 @@ function tabsHTML() {
   return `<div class="tabs">${home}${tks}<div class="grow"></div><div class="sync"><span id="syncMsg">${syncHTML()}</span><button data-act="refresh" title="Actualizar ahora">${ic('refresh', 14)}<span>Actualizar</span></button></div></div>`;
 }
 function bellHTML() {
-  const items = S.notifications.slice(0, 40).map(a => `<div class="al ${a.read ? '' : 'un'}" data-act="alertGo" data-id="${a.tid}" data-aid="${a.id}"><div>${ic(a.kind === 'vence' ? 'clock' : a.kind === 'avance' ? 'refresh' : 'bell', 16)}</div><div><div>${esc(a.text)}</div><div class="muted sm">${ago(a.ts)}</div></div></div>`).join('');
+  const items = S.notifications.slice(0, 40).map(a => `<div class="al ${a.read ? '' : 'un'}" data-act="alertGo" data-id="${a.tid}" data-aid="${a.id}"><div>${ic(a.kind === 'vence' ? 'clock' : a.kind === 'avance' ? 'refresh' : a.kind === 'cal' ? 'cal' : 'bell', 16)}</div><div><div>${esc(a.text)}</div><div class="muted sm">${ago(a.ts)}</div></div></div>`).join('');
   return `<div class="bellmenu"><div class="row sp" style="padding:10px 12px;border-bottom:1px solid var(--line)"><b>Notificaciones</b><button class="btn sm" data-act="alertsRead">Marcar leídas</button></div>${items || '<div class="empty">Sin notificaciones</div>'}</div>`;
 }
 function viewHTML() {
   if (!configured() && UI.route.v !== 'settings') return `<div class="page"><h1>Bienvenido</h1><p class="lead">Conecta primero el Worker (Zendesk, Slack e IA). Toma 10 minutos y es gratis.</p><button class="btn pri" data-act="nav" data-v="settings">Ir a Ajustes</button></div>`;
   switch (UI.route.v) {
     case 'ticket': return S.tickets[UI.route.id] ? ticketView(S.tickets[UI.route.id]) : '<div class="empty">Ticket no encontrado</div>';
+    case 'status': return statusView();
+    case 'cal': return calView();
     case 'pending': return pendingView();
     case 'daily': return dailyView();
     case 'templates': return templatesView();
@@ -749,6 +980,11 @@ const zdLink = t => C.base ? `${C.base}/agent/tickets/${t.id}` : '';
 const slLink = t => t.slackId && C.workspaceUrl ? `${C.workspaceUrl}archives/${t.slackId}` : '';
 
 /* ---------- dashboards ---------- */
+function entregaCell(t) {
+  const dv = deliveryOf(t); if (!dv) return '<span class="muted">sin fecha</span>';
+  const late = parseDue(dv.date) < new Date();
+  return `<span ${late ? 'style="color:var(--red);font-weight:600"' : ''}>${fmtDue(dv.date)}</span>`;
+}
 function findDash(id) { for (const f of S.folders) for (const d of f.dashboards) if (d.id === id) return d; return null; }
 function filterTickets(f) {
   return Object.values(S.tickets).filter(t => {
@@ -762,47 +998,18 @@ function filterTickets(f) {
     return true;
   }).sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
 }
-function dashView() {
-  const id = UI.route.id, d = id === 'all' ? null : findDash(id), f = d ? d.filters : UI.fAll;
-  const list = filterTickets(f);
-  const clients = [...new Set(Object.values(S.tickets).map(t => t.client).filter(Boolean))].sort();
-  const tree = `<aside class="tree"><h3><span>Dashboards</span><button class="ibtn" data-act="newFolder" title="Nueva carpeta">${ic('plus', 15)}</button></h3>
-    <div class="tn ${id === 'all' ? 'on' : ''}" data-act="selectDash" data-id="all">${ic('layout', 15)}<span>Todos los tickets</span><span class="c">${Object.keys(S.tickets).length}</span></div>
-    ${S.folders.map(fo => `<div class="tn f" data-act="toggleFolder" data-id="${fo.id}"><span class="chev ${fo.open ? '' : 'closed'}">${ic('chev', 14)}</span>${ic('folder', 15)}<span>${esc(fo.name)}</span><span class="acts">
-        <button class="ibtn" data-act="newDash" data-id="${fo.id}" title="Nuevo dashboard">${ic('plus', 14)}</button><button class="ibtn" data-act="renFolder" data-id="${fo.id}" title="Renombrar">${ic('edit', 14)}</button><button class="ibtn" data-act="delFolder" data-id="${fo.id}" title="Eliminar">${ic('trash', 14)}</button></span></div>
-      ${fo.open ? fo.dashboards.map(da => `<div class="tn d ${id === da.id ? 'on' : ''}" data-act="selectDash" data-id="${da.id}"><span>${esc(da.name)}</span><span class="c">${filterTickets(da.filters).length}</span><span class="acts"><button class="ibtn" data-act="renDash" data-id="${da.id}" title="Renombrar">${ic('edit', 14)}</button><button class="ibtn" data-act="delDash" data-id="${da.id}" title="Eliminar">${ic('trash', 14)}</button></span></div>`).join('') : ''}`).join('')}
-    </aside>`;
-  const chips = ['pry', 'evo', 'dt'].map(k => `<button class="chip ${(f.types || []).includes(k) ? 'on' : ''}" data-act="dfType" data-t="${k}">${TYPES[k]}</button>`).join('');
-  const sel = (k, opts, ph) => `<select data-ch="dfilter" data-k="${k}"><option value="">${ph}</option>${opts.map(o => `<option value="${esc(o[0])}" ${f[k] === o[0] ? 'selected' : ''}>${esc(o[1])}</option>`).join('')}</select>`;
-  const bar = `<div class="fbar">${chips}
-    ${sel('status', STATUSES.map(s => [s, s]), 'Estado interno')}${sel('client', clients.map(c => [c, c]), 'Cliente')}
-    ${sel('owner', [['cliente', 'Siguiente paso: Cliente'], ['inference', 'Siguiente paso: Inference']], 'Responsable')}${sel('slack', [['linked', 'Con Slack'], ['unlinked', 'Sin Slack']], 'Slack')}
-    <label class="row sm"><input type="checkbox" data-ch="dfilter" data-k="attention" ${f.attention ? 'checked' : ''}> Requieren atención</label>
-    <input type="text" data-ch="dfilter" data-k="q" placeholder="Buscar #, asunto, cliente…" value="${esc(f.q || '')}"></div>`;
-  const rows = list.map(t => {
-    const ns = nextStep(t), st = statusOf(t);
-    return `<tr class="click" data-act="openTicket" data-id="${t.id}"><td>${tagT(t.type)}</td><td class="num"><b>#${t.id}</b></td><td style="max-width:340px">${esc(t.subject)}</td><td>${esc(t.client || '—')}</td><td>${stDot(t.zdStatus)}${esc(t.zdStatus)}</td>
-      <td><span class="pill ${st === 'Esperando cliente' ? 'p-cliente' : st === 'Cerrado' ? 'p-grey' : 'p-inference'}">${esc(st)}</span></td>
-      <td style="max-width:300px">${ns ? esc(trunc(ns.text, 90)) : '<span class="muted">—</span>'}</td><td>${ns ? ownP(ns.owner) : ''}</td><td class="num">${ns ? fmtDue(ns.due) : ''}</td>
-      <td>${t.slackId ? '<span class="muted" title="' + esc(t.slackName) + '">' + ic('hash', 14) + '</span>' : '<span class="muted" title="Sin canal vinculado">—</span>'}</td><td>${flagsHTML(t)}</td><td class="muted sm">${ago(lastActivity(t))}</td></tr>`;
-  }).join('');
-  return `<div class="split">${tree}<section class="content"><div class="dhead"><h2>${d ? esc(d.name) : 'Todos los tickets'} <span class="muted" style="font-weight:400;font-size:13px">· ${list.length} ticket(s)</span></h2>${bar}</div>
-    ${list.length ? `<table class="tb"><thead><tr><th>Tipo</th><th>#</th><th>Asunto</th><th>Cliente</th><th>Zendesk</th><th>Estado interno</th><th>Siguiente paso</th><th>Resp.</th><th>Vence</th><th>Slack</th><th></th><th>Actividad</th></tr></thead><tbody>${rows}</tbody></table>` :
-      `<div class="empty">${Object.keys(S.tickets).length ? 'Ningún ticket coincide con este dashboard.' : 'Aún no hay tickets. Pulsa «Actualizar» para traerlos de Zendesk.'}</div>`}</section></div>`;
-}
-
 /* ---------- ticket ---------- */
 function ticketView(t) {
   const tab = UI.tab[t.id] || 'seg';
   const T = (k, icon, label) => `<button class="${tab === k ? 'on' : ''}" data-act="ttab" data-id="${t.id}" data-k="${k}">${ic(icon, 15)}${label}</button>`;
   const ru = C.users[t.requesterId], ag = C.users[t.assigneeId];
-  const body = ({ conv: convTab, slack: slackTab, seg: segTab, meet: meetTab, tpl: tplTab })[tab](t);
+  const body = ({ conv: convTab, slack: slackTab, seg: segTab, gantt: ganttTab, meet: meetTab, tpl: tplTab })[tab](t);
   return `<div class="crumbs"><span>${esc(t.client || 'Sin cliente')}</span><span>${esc(ru ? ru.name : 'Solicitante')}</span><span>${tagT(t.type)} <b>Ticket #${t.id}</b></span><span class="grow" style="flex:1"></span>
       ${zdLink(t) ? `<a href="${zdLink(t)}" target="_blank" rel="noopener">${ic('ext', 14)} Abrir en Zendesk</a>` : ''}${slLink(t) ? `<a href="${slLink(t)}" target="_blank" rel="noopener">${ic('hash', 14)} Abrir canal de Slack</a>` : ''}</div>
     <div class="tk"><aside class="tk-left">${propsHTML(t, ru, ag)}</aside>
     <section class="tk-center"><div class="tk-head"><div><h2>${esc(t.subject)}</h2><div class="muted sm">${esc(t.formName || TYPES[t.type])} · creado ${fmtTS(t.createdAt)} · actividad ${ago(lastActivity(t))}</div></div>
       <div class="row"><button class="btn" data-act="refreshOne" data-id="${t.id}" title="Actualizar este ticket">${ic('refresh', 14)}</button>${t.readyToClose ? `<button class="btn pri" data-act="closeTicket" data-id="${t.id}" ${UI.busy['close' + t.id] ? 'disabled' : ''}>${ic('archive', 14)} ${UI.busy['close' + t.id] ? 'Generando…' : 'Resumen final y archivar'}</button>` : `<button class="btn" data-act="closeTicket" data-id="${t.id}" title="Cerrar y archivar manualmente">${ic('archive', 14)} Archivar</button>`}</div></div>
-      <div class="tk-tabs">${T('seg', 'check', 'Seguimiento')}${T('conv', 'mail', 'Zendesk')}${T('slack', 'hash', 'Slack')}${T('meet', 'mic', 'Reuniones')}${T('tpl', 'file', 'Plantillas')}</div>
+      <div class="tk-tabs">${T('seg', 'check', 'Seguimiento')}${T('gantt', 'chart', 'Gantt y plan')}${T('conv', 'mail', 'Zendesk')}${T('slack', 'hash', 'Slack')}${T('meet', 'mic', 'Reuniones')}${T('tpl', 'file', 'Plantillas')}</div>
       <div class="tk-body">${body}</div></section>
     <aside class="tk-right">${aiPanel(t)}</aside></div>`;
 }
@@ -810,15 +1017,16 @@ function propsHTML(t, ru, ag) {
   const ns = nextStep(t);
   const sug = slackSuggestions(t).slice(0, 60);
   const slackBlock = t.slackId
-    ? `<div class="field row sp"><span>${ic('hash', 14)} ${esc(t.slackName)}${t.slackAuto ? ' <span class="muted sm">(auto)</span>' : ''}</span><button class="ibtn" data-act="unlinkSlack" data-id="${t.id}" title="Desvincular">${ic('x', 14)}</button></div>${t.slackArchived ? '<div class="sm" style="color:var(--amber);margin-top:4px">Canal archivado</div>' : ''}`
+    ? `<div class="field row sp"><span>${ic('hash', 14)} ${esc(t.slackName)}${t.slackAuto ? ` <span class="muted sm">(auto${t.slackMatch && t.slackMatch !== t.id ? ' por ' + esc(t.slackMatch) : ''})</span>` : ''}</span><button class="ibtn" data-act="unlinkSlack" data-id="${t.id}" title="Desvincular">${ic('x', 14)}</button></div>${t.slackArchived ? '<div class="sm" style="color:var(--amber);margin-top:4px">Canal archivado</div>' : ''}`
     : (C.channels.length ? `<select data-ch="linkSlack" data-id="${t.id}"><option value="">Vincular canal…</option>${sug.map(c => `<option value="${c.id}">#${esc(c.name)}${c.archived ? ' (archivado)' : ''}</option>`).join('')}</select>` : `<div class="field ro muted">${C.health && !C.health.slack ? 'Slack no configurado en el Worker' : UI.slackErr ? 'Error de Slack (ver pestaña Slack)' : 'Sin canales (aún)'}</div>`);
-  const zf = zdFields(t);
+  const zf = zdFields(t), dv = deliveryOf(t);
   return `<div class="fgrid"><label class="lb">Solicitante</label><div class="field ro">${esc(ru ? ru.name : '—')}<div class="muted sm">${esc(ru ? ru.email : '')}</div></div>
     <label class="lb">Agente asignado</label><div class="field ro">${esc(ag ? ag.name : '—')}</div>
     <label class="lb">Estado en Zendesk</label><div class="field ro">${stDot(t.zdStatus)}${esc(t.zdStatus)}</div>
     <label class="lb">Estado interno</label><select data-ch="internal" data-id="${t.id}"><option value="">Automático (${esc(derivedStatus(t))})</option>${STATUSES.map(s => `<option ${t.internal === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
     <label class="lb">Tipo</label><div class="field ro">${tagT(t.type)} ${esc(t.formName)}</div>
     <label class="lb">Cliente</label><div class="field ro">${esc(t.client || '—')}</div>
+    <label class="lb">Fecha de entrega</label><input type="date" data-ch="delivery" data-id="${t.id}" value="${esc(dv ? dv.date : '')}"><div class="muted sm" style="margin-top:3px">${dv ? (dv.src === 'zendesk' ? 'Desde Zendesk: ' + esc(dv.title) : 'Puesta a mano (solo en esta web)') : 'Sin fecha. La debe enviar ' + esc(S.settings.dateOwner) + (t.dateAsked ? ' · pedida ' + ago(t.dateAsked) : '')}</div>
     <label class="lb">Canal de Slack</label>${slackBlock}
     <label class="lb">Etiquetas</label><div class="field ro ztags">${(t.tags || []).map(x => `<span class="ztag">${esc(x)}</span>`).join('') || '—'}</div>
     <label class="lb">Siguiente paso</label><div class="field ro">${ns ? `${esc(ns.text)}<div style="margin-top:6px">${ownP(ns.owner)} <span class="muted sm">${ns.due ? 'vence ' + fmtDue(ns.due) : ''}</span></div>` : '<span class="muted">Sin pasos pendientes</span>'}</div>
@@ -832,7 +1040,7 @@ function convTab(t) {
 function slackWhy(t) {
   if (UI.slackErr) return `<b>Motivo:</b> ${esc(UI.slackErr)}`;
   if (!C.channels.length) return '<b>Motivo:</b> todavía no se han leído los canales de Slack. Pulsa «Actualizar» y espera unos segundos.';
-  return `<b>Motivo:</b> se leyeron ${C.channels.length} canal(es) pry-/evo-/dt- pero ninguno contiene el número <b>${esc(t.id)}</b>. Elige el canal a mano en el panel izquierdo (Canal de Slack).`;
+  return `<b>Motivo:</b> se leyeron ${C.channels.length} canal(es) pry-/evo-/dt- pero ninguno contiene ninguno de estos números: <b>${esc(ticketNums(t).join(', '))}</b>. Elige el canal a mano en el panel izquierdo (Canal de Slack).`;
 }
 function slackTab(t) {
   if (!t.slackId) return `<div class="empty">Este ticket no tiene canal de Slack vinculado.<br>Se vincula solo si el nombre del canal empieza con <b>pry-</b>, <b>evo-</b> o <b>dt-</b> y contiene el n.º de ticket (ej: evo-${esc(t.id)}-cliente-descripción).<div style="margin-top:12px;color:var(--ink)">${slackWhy(t)}</div></div>`;
@@ -844,13 +1052,15 @@ function slackTab(t) {
 /* --- seguimiento --- */
 function segTab(t) {
   const steps = (t.steps || []).slice().sort((a, b) => (a.done - b.done) || (a.due ? (b.due ? a.due.localeCompare(b.due) : -1) : (b.due ? 1 : 0)));
-  const rows = steps.map(s => `<tr class="${s.done ? 'done' : ''}"><td><input type="checkbox" data-ch="stepDone" data-id="${t.id}" data-sid="${s.id}" ${s.done ? 'checked' : ''}></td><td>${s.type === 'pendiente' ? 'Pendiente' : 'Siguiente paso'}</td><td>${esc(s.text)}</td><td>${ownP(s.owner)}</td><td class="num ${!s.done && s.due && parseDue(s.due) < new Date() ? '' : ''}" ${!s.done && s.due && parseDue(s.due) < new Date() ? 'style="color:var(--red);font-weight:600"' : ''}>${fmtDue(s.due)}</td><td><button class="ibtn" data-act="delStep" data-id="${t.id}" data-sid="${s.id}">${ic('trash', 14)}</button></td></tr>`).join('');
+  const rows = steps.map(s => `<tr class="${s.done ? 'done' : ''}"><td><input type="checkbox" data-ch="stepDone" data-id="${t.id}" data-sid="${s.id}" ${s.done ? 'checked' : ''}></td><td>${s.type === 'pendiente' ? 'Pendiente' : 'Siguiente paso'}</td><td>${esc(s.text)}</td><td>${ownP(s.owner)}</td><td><select class="mini" data-ch="stepField" data-k="area" data-id="${t.id}" data-sid="${s.id}">${areaOpts(s.area)}</select></td><td><input type="text" class="mini" list="dl_who" data-ch="stepField" data-k="who" data-id="${t.id}" data-sid="${s.id}" value="${esc(s.who || '')}" placeholder="Encargado"></td><td><input type="date" class="mini" data-ch="stepField" data-k="start" data-id="${t.id}" data-sid="${s.id}" value="${esc((s.start || '').slice(0, 10))}"></td><td class="num" ${!s.done && s.due && parseDue(s.due) < new Date() ? 'style="color:var(--red);font-weight:600"' : ''}>${fmtDue(s.due)}</td><td><button class="ibtn" data-act="delStep" data-id="${t.id}" data-sid="${s.id}">${ic('trash', 14)}</button></td></tr>`).join('');
   const rem = (t.reminders || []).slice().sort((a, b) => (a.done - b.done) || String(a.due).localeCompare(String(b.due)));
   const rrows = rem.map(r => `<tr class="${r.done ? 'done' : ''}"><td><input type="checkbox" data-ch="remDone" data-id="${t.id}" data-rid="${r.id}" ${r.done ? 'checked' : ''}></td><td>${esc(r.text)}</td><td class="num" ${!r.done && parseDue(r.due) < new Date() ? 'style="color:var(--red);font-weight:600"' : ''}>${fmtDue(r.due)}</td><td class="muted sm">${esc(r.source || '')}</td><td><button class="ibtn" data-act="delRem" data-id="${t.id}" data-rid="${r.id}">${ic('trash', 14)}</button></td></tr>`).join('');
   const det = detectedFor(t);
   return `<div class="sec"><h3>Siguientes pasos y pendientes</h3>
-    ${steps.length ? `<table class="tb"><thead><tr><th></th><th>Tipo</th><th>Descripción</th><th>Responsable</th><th>Vence</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="muted">Nada registrado. Usa la IA (panel derecho) o agrega manualmente.</div>'}
-    <div class="addrow"><select id="ns_type"><option value="siguiente">Siguiente paso</option><option value="pendiente">Pendiente</option></select><input type="text" id="ns_text" placeholder="Descripción"><select id="ns_owner"><option value="cliente">Cliente</option><option value="inference">Inference</option></select><input type="date" id="ns_date"><input type="time" id="ns_time"><button class="btn pri" data-act="addStep" data-id="${t.id}">${ic('plus', 14)} Agregar</button></div></div>
+    ${steps.length ? `<table class="tb"><thead><tr><th></th><th>Tipo</th><th>Descripción</th><th>Responsable</th><th>Área</th><th>Encargado</th><th>Inicio</th><th>Vence</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="muted">Nada registrado. Usa la IA (panel derecho) o agrega manualmente.</div>'}
+    <div class="addrow"><select id="ns_type"><option value="siguiente">Siguiente paso</option><option value="pendiente">Pendiente</option></select><input type="text" id="ns_text" placeholder="Descripción"><select id="ns_owner"><option value="cliente">Cliente</option><option value="inference">Inference</option></select><input type="date" id="ns_date"><input type="time" id="ns_time"><button class="btn pri" data-act="addStep" data-id="${t.id}">${ic('plus', 14)} Agregar</button></div>
+    <div class="addrowA"><select id="ns_area">${areaOpts('')}</select><input type="text" id="ns_who" list="dl_who" placeholder="Encargado (quién lo hace)"><label>Inicio (opcional)<input type="date" id="ns_start"></label></div>${whoDatalist()}
+    <div class="muted sm" style="margin-top:6px">Los pasos con fecha de vencimiento salen en el Gantt y en el Calendario con su área y encargado.</div></div>
   <div class="sec"><h3>Recordatorios</h3>
     ${rem.length ? `<table class="tb"><thead><tr><th></th><th>Recordatorio</th><th>Fecha</th><th>Origen</th><th></th></tr></thead><tbody>${rrows}</tbody></table>` : '<div class="muted">Sin recordatorios.</div>'}
     <div class="addrow2"><input type="text" id="rm_text" placeholder="Qué debo recordar"><input type="date" id="rm_date"><input type="time" id="rm_time"><button class="btn pri" data-act="addRem" data-id="${t.id}">${ic('plus', 14)} Agregar</button></div></div>
@@ -932,10 +1142,11 @@ function dailyRows() {
   if (UI.daily.scope !== 'all') { const d = findDash(UI.daily.scope); if (d) { const ids = new Set(filterTickets(d.filters).map(t => t.id)); list = list.filter(t => ids.has(t.id)); } }
   return list.sort((a, b) => a.client.localeCompare(b.client) || a.id - b.id).map(t => {
     const ns = nextStep(t), o = openSteps(t);
-    return { t, st: statusOf(t), ns, nc: o.filter(s => s.owner === 'cliente').length, ni: o.filter(s => s.owner === 'inference').length };
+    return { t, st: statusOf(t), ns, lp: lastPublic(t), nc: o.filter(s => s.owner === 'cliente').length, ni: o.filter(s => s.owner === 'inference').length };
   });
 }
-const dailyLine = r => `Ticket #${r.t.id} | ${r.t.type.toUpperCase()} | ${r.t.client || '-'} | Estado: ${r.st} | Siguiente: ${r.ns ? r.ns.text + ' (' + OWN[r.ns.owner] + ')' : 'sin definir'}${r.ns && r.ns.due ? ' | Vence: ' + fmtDue(r.ns.due) : ''}`;
+const lastMove = r => r.lp ? `${r.lp.side === 'cliente' ? 'Cliente' : 'Inference'} ${ago(r.lp.at)}` : 'sin movimientos';
+const dailyLine = r => `Ticket #${r.t.id} | ${r.t.type.toUpperCase()} | ${r.t.client || '-'} | Estado: ${r.st} | Siguiente: ${r.ns ? r.ns.text + ' (' + OWN[r.ns.owner] + ')' : 'sin definir (último: ' + lastMove(r) + ')'}${r.ns && r.ns.due ? ' | Vence: ' + fmtDue(r.ns.due) : ''}`;
 function dailyView() {
   const rows = dailyRows();
   const scopes = [['all', 'Todos los tickets abiertos'], ...S.folders.flatMap(f => f.dashboards.map(d => [d.id, f.name + ' / ' + d.name]))];
@@ -943,7 +1154,7 @@ function dailyView() {
     <div class="row wrap" style="margin-bottom:14px"><select style="max-width:360px" data-ch="dailyScope">${scopes.map(s => `<option value="${esc(s[0])}" ${UI.daily.scope === s[0] ? 'selected' : ''}>${esc(s[1])}</option>`).join('')}</select>
       <button class="btn pri" data-act="dailyCopy">${ic('copy', 14)} Copiar texto</button><button class="btn" data-act="dailyCopyHTML">${ic('copy', 14)} Copiar tabla</button><button class="btn" data-act="dailyAI" ${UI.busy.daily ? 'disabled' : ''}>${ic('spark', 14)} ${UI.busy.daily ? 'Redactando…' : 'Resumen con IA'}</button></div>
     ${UI.dailyText ? `<div class="aibox"><h4>Resumen del día (IA)</h4><pre class="pre" id="dailyAI">${esc(UI.dailyText)}</pre><button class="btn sm" style="margin-top:8px" data-act="copyEl" data-el="dailyAI">${ic('copy', 13)} Copiar</button></div>` : ''}
-    ${rows.length ? `<table class="tb"><thead><tr><th>Ticket</th><th>Tipo</th><th>Cliente</th><th>Estado</th><th>Siguiente paso</th><th>Resp.</th><th>Vence</th><th>Abiertos (cliente / Inference)</th></tr></thead><tbody>${rows.map(r => `<tr class="click" data-act="openTicket" data-id="${r.t.id}"><td class="num"><b>#${r.t.id}</b></td><td>${tagT(r.t.type)}</td><td>${esc(r.t.client || '—')}</td><td><span class="pill ${r.st === 'Esperando cliente' ? 'p-cliente' : 'p-inference'}">${esc(r.st)}</span></td><td>${r.ns ? esc(r.ns.text) : '<span class="muted">sin definir</span>'}</td><td>${r.ns ? ownP(r.ns.owner) : ''}</td><td class="num">${r.ns ? fmtDue(r.ns.due) : ''}</td><td class="num">${r.nc} / ${r.ni}</td></tr>`).join('')}</tbody></table>` : '<div class="empty">No hay tickets abiertos.</div>'}</div>`;
+    ${rows.length ? `<table class="tb"><thead><tr><th>Ticket</th><th>Tipo</th><th>Cliente</th><th>Estado</th><th>Siguiente paso</th><th>Resp.</th><th>Vence</th><th>Último movimiento</th><th>Abiertos (cliente / Inference)</th></tr></thead><tbody>${rows.map(r => `<tr class="click" data-act="openTicket" data-id="${r.t.id}"><td class="num"><b>#${r.t.id}</b></td><td>${tagT(r.t.type)}</td><td>${esc(r.t.client || '—')}</td><td><span class="pill ${r.st === 'Esperando cliente' ? 'p-cliente' : 'p-inference'}">${esc(r.st)}</span></td><td>${r.ns ? esc(r.ns.text) : '<span class="muted">sin definir</span>'}</td><td>${r.ns ? ownP(r.ns.owner) : ''}</td><td class="num">${r.ns ? fmtDue(r.ns.due) : ''}</td><td class="muted sm">${esc(lastMove(r))}</td><td class="num">${r.nc} / ${r.ni}</td></tr>`).join('')}</tbody></table>` : '<div class="empty">No hay tickets abiertos.</div>'}</div>`;
 }
 
 /* ---------- plantillas globales ---------- */
@@ -971,10 +1182,15 @@ function settingsView() {
       <div class="muted sm">Sesión iniciada como <b>${esc((session() || {}).user || '')}</b>, vence ${esc(fmtTS((session() || {}).exp))}.</div>
       <div class="row"><button class="btn pri" data-act="testConn">Probar conexión</button><button class="btn" data-act="logout">${ic('logout', 14)} Cerrar sesión</button>${h ? `<span class="pill ${h.zendesk ? 'p-green' : 'p-red'}">Zendesk</span><span class="pill ${h.slack ? 'p-green' : 'p-red'}">Slack</span><span class="pill ${h.ai ? 'p-green' : 'p-red'}">IA</span><span class="pill ${h.kv ? 'p-green' : 'p-grey'}">KV</span><span class="muted sm">${esc(h.model || '')}</span>` : ''}</div></div>
     <div class="card" style="margin-bottom:16px"><h3>Qué tickets entran</h3>${inp('keywords', 'Palabras clave del Formulario de Zendesk', 'text', 'Entran los tickets cuyo «Formulario» contenga alguna (separadas por coma): evolutivo, deuda técnica, proyecto.')}
-      ${inp('internalDomains', 'Dominios del equipo Inference', 'text', 'Sirve para distinguir quién escribió: cliente o Inference.')}${chk('includeSolved', 'Incluir tickets resueltos al sincronizar')}
+      ${inp('internalDomains', 'Dominios del equipo Inference', 'text', 'Sirve para distinguir quién escribió: cliente o Inference.')}${chk('includeSolved', 'Incluir tickets resueltos al sincronizar')}${chk('autoDates', 'Crear recordatorios solos cuando aparezca una fecha en Zendesk, Slack o en el análisis de IA')}
+      ${inp('dateOwner', 'Quién envía las fechas de entrega', 'text', 'Se usa en el Calendario y en los avisos cuando falta una fecha.')}
+      ${inp('areas', 'Áreas del equipo (separadas por coma)', 'text', 'Aparecen al asignar área a hitos, entregables y tareas.')}${inp('provider', 'Nombre del proveedor (para el Status)', 'text', 'Sale en el encabezado del reporte de Status.')}
       <div class="muted sm" style="margin-top:10px">Formularios detectados: ${C.forms.length ? C.forms.map(f => `<span class="ztag">${esc(f.name)}</span>`).join(' ') : '—'}</div></div>
     <div class="card" style="margin-bottom:16px"><h3>Frecuencia y alertas</h3><div class="row wrap" style="gap:18px;align-items:flex-start"><div style="width:180px">${inp('pollSec', 'Zendesk cada (seg)', 'number')}</div><div style="width:180px">${inp('slackPollSec', 'Slack cada (seg)', 'number')}</div><div style="width:180px">${inp('leadMin', 'Avisar antes (min)', 'number')}</div><div style="width:180px">${inp('staleDays', 'Seguimiento tras (días)', 'number', 'Sin respuesta del cliente')}</div><div style="width:180px">${inp('replyHours', 'Responder en (horas)', 'number', 'Cliente esperando')}</div><div style="width:180px">${inp('dailyTime', 'Update del día a las', 'time')}</div></div>
       <div class="row" style="margin-top:12px"><button class="btn" data-act="askNotif">Activar avisos del navegador</button><span class="muted sm">Estado: ${'Notification' in window ? Notification.permission : 'no disponible'}. Los avisos funcionan mientras la pestaña esté abierta (fíjala).</span></div>${inp('myName', 'Tu nombre (firma de plantillas)')}</div>
+    <div class="card" style="margin-bottom:16px"><h3>Crear usuario de acceso</h3><div class="muted sm" style="margin-bottom:8px">Genera un usuario y una contraseña aleatoria. Pégalos en el Worker (secreto <code>APP_USERS</code>) para dar acceso a otra persona. No se guarda nada en esta web.</div>
+      <div class="row wrap"><input type="text" id="nu_user" placeholder="usuario (ej: maria)" value="${esc(UI.nu.user)}" style="width:200px"><button class="btn pri" data-act="genUser">${ic('spark', 14)} Generar</button></div>
+      ${UI.nu.pass ? `<div class="aibox" style="margin-top:10px"><h4>Credenciales</h4><div>Usuario: <b>${esc(UI.nu.user)}</b></div><div>Contraseña: <code id="nu_pass">${esc(UI.nu.pass)}</code></div><div class="muted sm" style="margin:8px 0 4px">Línea para <code>APP_USERS</code> (JSON; agrega más usuarios separados por coma):</div><pre class="pre" id="nu_json">${esc(JSON.stringify({ [UI.nu.user]: UI.nu.pass }))}</pre><div class="row" style="margin-top:8px"><button class="btn sm" data-act="copyEl" data-el="nu_pass">${ic('copy', 13)} Copiar contraseña</button><button class="btn sm" data-act="copyEl" data-el="nu_json">${ic('copy', 13)} Copiar JSON</button></div></div>` : ''}</div>
     <div class="card" style="margin-bottom:16px"><h3>Datos</h3><div class="row wrap"><button class="btn" data-act="exportData">${ic('down', 14)} Exportar copia</button><label class="btn">${ic('up', 14)} Importar copia<input type="file" accept=".json" style="display:none" data-ch="importData"></label>
       ${chk('syncKV', 'Sincronizar con la nube gratuita (KV)')}<button class="btn" data-act="kvPush">Subir ahora</button><button class="btn" data-act="kvPull">Descargar</button></div></div>
     <div class="card"><h3>Canales de Slack detectados sin ticket (${unl.length})</h3>${UI.slackErr ? `<div class="login-err" style="margin:8px 0">Slack: ${esc(UI.slackErr)}</div>` : ''}<div class="muted sm" style="margin:6px 0 10px">Nombres válidos: pry-… / evo-… / dt-…  Si no tienen número de ticket, vincúlalos a mano desde el ticket.</div><div class="ztags">${unl.slice(0, 80).map(c => `<span class="ztag">#${esc(c.name)}${c.archived ? ' ✓' : ''}</span>`).join('') || '<span class="muted">—</span>'}</div></div></div>`;
@@ -987,6 +1203,298 @@ function toast(msg, type) {
 }
 function openModal(html) { $('#modal').innerHTML = `<div class="mbox">${html}</div>`; }
 function closeModal() { $('#modal').innerHTML = ''; if (pendingRender) render(); }
+
+/* =====================================================================
+   v1.5 — Vistas: Status, Gantt, plan, calendario y dashboards editables
+   ===================================================================== */
+function areaOpts(sel) {
+  const list = allAreas(); if (sel && !list.includes(sel)) list.push(sel);
+  return `<option value="">Área…</option>${list.map(a => `<option ${a === sel ? 'selected' : ''}>${esc(a)}</option>`).join('')}`;
+}
+const whoDatalist = () => `<datalist id="dl_who">${whoSuggestions().map(w => `<option value="${esc(w)}">`).join('')}</datalist>`;
+const statePill = s => `<span class="pill ${({ Vencido: 'p-red', Hecho: 'p-green', Pasado: 'p-grey', Hoy: 'p-cliente', 'En curso': 'p-inference', 'Próximo': 'p-grey' })[s] || 'p-grey'}">${s}</span>`;
+
+/* ================= STATUS POR CLIENTE ================= */
+function statusView() {
+  const s = UI.st, clients = statusClients(), { cl, list } = statusList(), m = s.month, edit = s.edit;
+  const rows = list.map(t => ({ t, r: repOf(t), d: repDerived(t), est: repEstado(t) }));
+  const counts = {}; REP_STATES.forEach(x => counts[x[0]] = 0); rows.forEach(x => counts[x.est]++);
+  const used = rows.reduce((a, x) => a + (parseFloat(x.r.hours[m]) || 0), 0);
+  const estTotal = rows.reduce((a, x) => a + (parseFloat(repHoursEst(x.t)) || 0), 0);
+  const one = cl !== '*' && cl !== '__none__';
+  const bolsa = one ? (parseFloat(cfgGet(cl).bolsa) || 0) : [...new Set(list.map(t => t.client).filter(Boolean))].reduce((a, c) => a + (parseFloat(cfgGet(c).bolsa) || 0), 0);
+  const saldo = bolsa - used;
+  const mLabel = new Date(m + '-01T00:00:00').toLocaleDateString('es-PE', { month: 'long', year: 'numeric' });
+  const title = cl === '*' ? 'Todos los clientes' : cl === '__none__' ? 'Sin cliente' : cl;
+  const fcorte = new Date(s.date + 'T00:00:00').toLocaleDateString('es-PE');
+  const plat = one ? cfgGet(cl).plataforma : '';
+  const chips = ['pry', 'evo', 'dt'].map(k => `<button class="chip ${s.types.includes(k) ? 'on' : ''}" data-act="stType" data-t="${k}">${TYPES[k]}</button>`).join('');
+  const tiles = `<div class="st-tile"><b>${rows.length}</b><span>Requerimientos en seguimiento</span></div>` + REP_STATES.map(([n, c]) => `<div class="st-tile"><b style="color:${c}">${counts[n]}</b><span><i class="st-dot" style="background:${c}"></i>${n}</span></div>`).join('');
+  const trs = rows.map(({ t, r, d, est }) => {
+    const e = repHoursEst(t), zh = zdHours(t);
+    const txt = (k, ph) => edit ? `<input type="text" data-ch="repField" data-id="${t.id}" data-k="${k}" value="${esc(r[k])}" placeholder="${esc(ph || '')}">` : esc(r[k] || d[k] || '—');
+    const area = (r.area || d.area) ;
+    return `<tr><td class="num"><a href="#" data-act="openTicket" data-id="${t.id}"><b>${esc(t.id)}</b></a><div class="muted sm">${t.type.toUpperCase()}</div></td>
+      <td>${esc(tplVars(t).asunto)}</td>
+      <td>${edit ? txt('area', d.area) : esc(area || '—')}</td>
+      <td style="white-space:nowrap">${edit ? `<span class="st-dot" style="background:${repColor(est)}"></span><select data-ch="repField" data-id="${t.id}" data-k="estado"><option value="">Auto · ${esc(repEstado({ ...t, rep: { ...r, estado: '' } }))}</option>${REP_STATES.map(([n]) => `<option ${r.estado === n ? 'selected' : ''}>${n}</option>`).join('')}</select>` : `<span class="st-dot" style="background:${repColor(est)}"></span>${esc(est)}`}</td>
+      <td>${edit ? txt('resp', d.resp) : esc(r.resp || d.resp || '—')}</td>
+      <td class="num">${edit ? `<input type="number" step="0.5" min="0" data-ch="repField" data-id="${t.id}" data-k="hEst" value="${esc(r.hEst)}" placeholder="${zh === null ? 'Por definir' : zh}">` : (e === '' ? 'Por definir' : fmtH(e))}</td>
+      <td class="num">${edit ? `<input type="number" step="0.5" min="0" data-ch="repHours" data-id="${t.id}" value="${esc(r.hours[m] ?? '')}" placeholder="0">` : fmtH(r.hours[m] || 0)}</td>
+      <td>${edit ? `<textarea rows="3" data-ch="repField" data-id="${t.id}" data-k="sit" placeholder="${esc(d.sit)}">${esc(r.sit)}</textarea>` : esc(r.sit || d.sit || '—')}</td>
+      <td>${edit ? `<textarea rows="3" data-ch="repField" data-id="${t.id}" data-k="next" placeholder="${esc(d.next)}">${esc(r.next)}</textarea>` : esc(r.next || d.next || '—')}</td>
+      <td class="noprint"><button class="ibtn" data-act="repAI" data-id="${t.id}" title="Completar situación con IA" ${UI.busy['ai' + t.id] ? 'disabled' : ''}>${ic('spark', 15)}</button></td></tr>`;
+  }).join('');
+  const bolsaBox = one && edit ? `<input type="number" step="0.5" min="0" class="st-num" data-ch="cfgField" data-c="${esc(cl)}" data-k="bolsa" value="${esc(cfgGet(cl).bolsa)}" placeholder="0">` : `<b>${fmtH(bolsa).replace(' h', '')}</b>`;
+  return `<div class="page stp" style="max-width:1500px">
+    <div class="fbar noprint" style="margin-bottom:14px">
+      <select data-ch="stSel" data-k="client" style="min-width:220px">${[['*', 'Todos los clientes'], ...clients.map(c => [c, c]), ['__none__', 'Sin cliente']].map(([v, l]) => `<option value="${esc(v)}" ${v === cl ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
+      <label class="row sm">Mes <input type="month" data-ch="stSel" data-k="month" value="${esc(m)}"></label>
+      <label class="row sm">Fecha de corte <input type="date" data-ch="stSel" data-k="date" value="${esc(s.date)}"></label>
+      ${chips}<label class="row sm"><input type="checkbox" data-ch="stChk" ${s.closed ? 'checked' : ''}> Incluir cerrados y finalizados</label>
+      <span style="flex:1"></span>
+      <button class="btn" data-act="stEdit">${ic('edit', 14)} ${edit ? 'Vista de reporte' : 'Editar'}</button>
+      <button class="btn" data-act="stFill" title="Completa los campos vacíos con lo que ya hay en Seguimiento y la IA">${ic('spark', 14)} Autocompletar</button>
+      <button class="btn" data-act="stCopy">${ic('copy', 14)} Copiar tabla</button>
+      <button class="btn pri" data-act="stPrint">${ic('file', 14)} Imprimir / PDF</button></div>
+    <div class="st-head"><div><h1>${esc(title)} – Status de requerimientos</h1>
+      ${one ? `<div class="st-sub">Plataforma: ${edit ? `<input type="text" class="st-plat" data-ch="cfgField" data-c="${esc(cl)}" data-k="plataforma" value="${esc(plat)}" placeholder="Ej: Zendesk integrada con Five9 (Llamadas)">` : esc(plat || '—')}</div>` : ''}</div>
+      <div class="st-brand"><b>${esc(S.settings.provider || 'Inference Labs9')}</b></div></div>
+    <div class="st-meta"><span>${ic('cal', 15)} Fecha de corte: <b>${esc(fcorte)}</b></span><span>Cliente: <b>${esc(title)}</b></span><span>Proveedor: <b>${esc(S.settings.provider || '')}</b></span></div>
+    <div class="st-top"><div class="st-box"><h3>Resumen general</h3><div class="st-tiles">${tiles}</div><div class="muted sm" style="margin-top:8px">Total de requerimientos: <b>${rows.length}</b></div></div>
+      <div class="st-box"><h3>Control de horas – ${esc(mLabel)}</h3><div class="st-hours">
+        <div class="st-h free"><div class="muted sm">Horas libres al mes</div>${bolsaBox}<div class="muted sm">Bolsa mensual contratada</div></div>
+        <div class="st-h used"><div class="muted sm">Horas utilizadas este mes</div><b>${fmtH(used).replace(' h', '')}</b><div class="muted sm">Total horas utilizadas</div></div>
+        <div class="st-h bal ${saldo >= 0 ? 'pos' : ''}"><div class="muted sm">Horas disponibles (saldo)</div><b style="color:${saldo >= 0 ? 'var(--green)' : 'var(--red)'}">${fmtH(saldo).replace(' h', '')}</b><div class="muted sm">Saldo restante</div></div></div>
+        <div class="muted sm" style="margin-top:8px">${ic('clock', 13)} La bolsa mensual se renueva cada mes. Las horas utilizadas se guardan por mes.</div></div></div>
+    <div class="st-bar">Seguimiento de requerimientos</div>
+    ${rows.length ? `<table class="st-table"><thead><tr><th>N°</th><th>Requerimiento</th><th>Área / Impacto</th><th>Estado</th><th>Responsable / Dependencia</th><th>Horas estimadas</th><th>Horas utilizadas este mes</th><th>Situación actual</th><th>Próxima acción</th><th class="noprint"></th></tr></thead><tbody>${trs}</tbody></table>` : '<div class="empty">No hay requerimientos para este cliente con estos filtros.</div>'}
+    <div class="st-foot"><div class="st-legend">${REP_STATES.map(([n, c]) => `<span><i class="st-dot" style="background:${c}"></i>${n}</span>`).join('')}</div><div class="st-total">Total horas estimadas de los requerimientos: <b>${fmtH(estTotal)}</b></div></div></div>`;
+}
+
+/* ================= GANTT + PLAN (dentro del ticket) ================= */
+function ganttTab(t) {
+  const items = ticketItems(t);
+  return `<div class="row sp" style="margin-bottom:10px"><div class="muted sm">Azul = hitos · Morado = entregables · Naranja = tareas. La <b>Z</b> indica que la fecha viene de Zendesk (si la cambias allá, se actualiza sola). La línea roja es hoy.</div>
+    <div class="row"><button class="btn sm" data-act="gz" data-n="-1" title="Alejar">−</button><span class="muted sm">Zoom</span><button class="btn sm" data-act="gz" data-n="1" title="Acercar">+</button></div></div>
+    ${items.length ? ganttChart(items) : '<div class="empty" style="padding:30px">Este ticket aún no tiene fechas. Agrega hitos, entregables o tareas abajo, o completa los campos de fecha en Zendesk.</div>'}
+    ${planSection(t)}`;
+}
+function ganttChart(items) {
+  const td = isoDay(new Date()), LW = 280;
+  let min = td, max = td;
+  items.forEach(i => { if (i.start < min) min = i.start; if (i.end > max) max = i.end; });
+  min = addDays(min, -3); max = addDays(max, 7);
+  const total = dDiff(min, max) + 1;
+  const px = Math.round(Math.max(4, Math.min(64, (820 / total) * UI.gz))), W = total * px;
+  const months = [], wk = [];
+  let firstMon = -1;
+  for (let i = 0; i < total; i++) {
+    const d = dIso(addDays(min, i)), key = d.getFullYear() + '-' + d.getMonth(), last = months[months.length - 1];
+    if (last && last.key === key) last.n++; else months.push({ key, n: 1, label: d.toLocaleDateString('es-PE', { month: 'short', year: '2-digit' }) });
+    if (d.getDay() === 1) { if (firstMon < 0) firstMon = i; wk.push(`<span style="left:${i * px}px">${d.getDate()}</span>`); }
+  }
+  const grid = `background-image:linear-gradient(to right,#e6e9ec 1px,transparent 1px);background-size:${7 * px}px 100%;background-position:${Math.max(0, firstMon) * px}px 0`;
+  const row = i => {
+    const l = dDiff(min, i.start) * px, w = (dDiff(i.start, i.end) + 1) * px, single = i.start === i.end, st = itemState(i);
+    const cls = (i.done ? ' g-done' : '') + (st === 'Vencido' ? ' g-late' : '');
+    const mark = single && i.kind !== 'tarea' ? `<span class="g-dia g-${i.kind}${cls}" style="left:${l + px / 2 - 7}px"></span>` : `<span class="g-bar g-${i.kind}${cls}" style="left:${l}px;width:${Math.max(w, 10)}px"></span>`;
+    const rng = single ? fmtDue(i.start) : `${fmtDue(i.start)} → ${fmtDue(i.end)}`;
+    const tx = `<span class="g-txt" style="left:${l + (single && i.kind !== 'tarea' ? px / 2 + 12 : Math.max(w, 10) + 6)}px">${esc(rng)}${i.who ? ' · ' + esc(i.who.split(' ')[0]) : ''}</span>`;
+    const tip = `${i.title} · ${rng} · ${i.area || 'sin área'} · ${i.who || 'sin encargado'} · ${st}`;
+    return `<div class="g-row"><div class="g-lbl" title="${esc(tip)}"><div class="g-t">${esc(trunc(i.title, 40))}${i.src === 'zendesk' ? '<span class="zb">Z</span>' : ''}</div><div class="g-s">${esc(i.area || 'Sin área')} · ${esc(i.who || 'sin encargado')}</div></div><div class="g-track" style="width:${W}px;${grid}">${mark}${tx}</div></div>`;
+  };
+  const body = [['hito', 'Hitos'], ['entregable', 'Entregables'], ['tarea', 'Tareas del equipo']].map(([k, label]) => {
+    const list = items.filter(i => i.kind === k).sort((a, b) => a.start.localeCompare(b.start) || a.end.localeCompare(b.end));
+    return list.length ? `<div class="g-row g-grp"><div class="g-lbl"><b>${label}</b> <span class="muted sm">(${list.length})</span></div><div class="g-track" style="width:${W}px"></div></div>${list.map(row).join('')}` : '';
+  }).join('');
+  const todayX = LW + (dDiff(min, td) + 0.5) * px;
+  return `<div class="gantt" data-today="${Math.round(todayX)}"><div class="g-body" style="width:${LW + W}px">
+    <div class="g-head"><div class="g-row" style="min-height:0"><div class="g-lbl" style="height:38px"></div><div class="g-track" style="width:${W}px"><div class="g-mh">${months.map(x => `<div style="width:${x.n * px}px">${esc(x.label)}</div>`).join('')}</div><div class="g-wk">${wk.join('')}</div></div></div></div>
+    ${body}<div class="g-today" style="left:${Math.round(todayX)}px" title="Hoy"></div></div></div>`;
+}
+function planSection(t) {
+  const plan = (t.plan || []).slice().sort((a, b) => (a.done - b.done) || String(a.start).localeCompare(String(b.start)));
+  const rows = plan.map(p => `<tr class="${p.done ? 'done' : ''}"><td><input type="checkbox" data-ch="planDone" data-id="${t.id}" data-pid="${p.id}" ${p.done ? 'checked' : ''}></td><td>${KIND_LABEL[p.kind] || p.kind}</td><td>${esc(p.text)}</td>
+    <td><select class="mini" data-ch="planField" data-k="area" data-id="${t.id}" data-pid="${p.id}">${areaOpts(p.area)}</select></td>
+    <td><input type="text" class="mini" list="dl_who" data-ch="planField" data-k="who" data-id="${t.id}" data-pid="${p.id}" value="${esc(p.who || '')}" placeholder="Encargado"></td>
+    <td class="num">${fmtDue(p.start)}</td><td class="num">${fmtDue(p.end)}</td><td><button class="ibtn" data-act="delPlan" data-id="${t.id}" data-pid="${p.id}">${ic('trash', 14)}</button></td></tr>`).join('');
+  return `<div class="sec" style="margin-top:22px"><h3>Plan del proyecto</h3>
+    <div class="muted sm" style="margin-bottom:8px">Agrega aquí hitos, entregables o tareas con fecha de inicio y fin, su área y su encargado. Los pasos de «Seguimiento» que tengan fecha también salen en el Gantt y en el calendario.</div>
+    ${plan.length ? `<table class="tb"><thead><tr><th></th><th>Tipo</th><th>Nombre</th><th>Área</th><th>Encargado</th><th>Inicio</th><th>Fin</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : ''}
+    <div class="addrowB"><select id="pl_kind" style="width:120px"><option value="hito">Hito</option><option value="entregable">Entregable</option><option value="tarea">Tarea</option></select><input type="text" id="pl_text" class="grow2" placeholder="Nombre (ej: Configuración de IVR)"><select id="pl_area" style="width:150px">${areaOpts('')}</select><input type="text" id="pl_who" list="dl_who" placeholder="Encargado" style="width:150px"><label>Inicio<input type="date" id="pl_start"></label><label>Fin (opcional)<input type="date" id="pl_end"></label><button class="btn pri" data-act="addPlan" data-id="${t.id}">${ic('plus', 14)} Agregar</button></div>${whoDatalist()}</div>`;
+}
+
+/* ================= CALENDARIO (entregas, hitos y tareas) ================= */
+function evChip(e) {
+  const t = e.t, who = e.who ? `[${e.who.split(' ')[0]}] ` : '';
+  const txt = `#${t.id} ${e.kind === 'entrega' ? 'Entrega' : who + trunc(e.label, 28)}`;
+  const st = e.kind === 'entrega' ? `background:var(--${t.type})` : `border-left:3px solid var(--${t.type})`;
+  return `<a href="#" class="ev ev-${e.kind}" style="${st}" data-act="openTicket" data-id="${t.id}" title="${esc(`#${t.id} ${t.client ? t.client + ' · ' : ''}${t.subject} — ${e.label}${e.area ? ' · ' + e.area : ''}${e.who ? ' · ' + e.who : ''}`)}">${esc(txt)}</a>`;
+}
+function calView() {
+  const f = UI.cal, first = new Date(f.y, f.m, 1), off = (first.getDay() + 6) % 7, nd = new Date(f.y, f.m + 1, 0).getDate();
+  const ev = calEvents(f), by = {}; ev.forEach(e => (by[e.date] = by[e.date] || []).push(e));
+  const td = isoDay(new Date()), total = Math.ceil((off + nd) / 7) * 7;
+  let cells = ['Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom'].map(d => `<div class="ch">${d}</div>`).join('');
+  for (let i = 0; i < total; i++) {
+    const d = i - off + 1;
+    if (d < 1 || d > nd) { cells += '<div class="cc out"></div>'; continue; }
+    const iso = `${f.y}-${pad(f.m + 1)}-${pad(d)}`, list = (by[iso] || []).sort((a, b) => KORD[a.kind] - KORD[b.kind]);
+    cells += `<div class="cc ${iso === td ? 'today' : ''}"><div class="cd">${d}</div>${list.slice(0, 3).map(evChip).join('')}${list.length > 3 ? `<button class="more" data-act="calDay" data-d="${iso}">+${list.length - 3} más</button>` : ''}</div>`;
+  }
+  const missTypes = calMissTypes(), miss = missingDelivery(missTypes);
+  const entregas = ev.filter(e => e.kind === 'entrega').sort((a, b) => a.date.localeCompare(b.date));
+  const chips = ['pry', 'evo', 'dt'].map(k => `<button class="chip ${f.types.includes(k) ? 'on' : ''}" data-act="calType" data-t="${k}">${TYPES[k]}</button>`).join('');
+  const title = first.toLocaleDateString('es-PE', { month: 'long', year: 'numeric' });
+  const sel = (k, opts, ph) => `<select data-ch="calSel" data-k="${k}"><option value="">${ph}</option>${opts.map(o => `<option ${f[k] === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
+  const prox = entregas.filter(e => daysTo(e.date) >= -30).slice(0, 14).map(e => {
+    const n = daysTo(e.date), late = n < 0;
+    return `<tr class="click" data-act="openTicket" data-id="${e.t.id}"><td class="num" style="white-space:nowrap"><b>${fmtDue(e.date)}</b></td><td><span class="pill ${late ? 'p-red' : n <= 7 ? 'p-cliente' : 'p-grey'}">${late ? `atrasado ${-n} d` : n === 0 ? 'hoy' : `en ${n} d`}</span></td><td>${tagT(e.t.type)} <b>#${e.t.id}</b></td><td>${esc(e.t.client || '—')}</td><td>${esc(trunc(tplVars(e.t).asunto, 60))}</td></tr>`;
+  }).join('');
+  const lim = addDays(td, 30);
+  const acts = ev.filter(e => ['tarea', 'hito', 'entregable'].includes(e.kind) && e.date >= td && e.date <= lim).sort((a, b) => a.date.localeCompare(b.date) || KORD[a.kind] - KORD[b.kind]);
+  const load = {}; acts.filter(e => e.kind === 'tarea').forEach(e => { const k = e.who || ''; load[k] = (load[k] || 0) + 1; });
+  const loadChips = Object.entries(load).sort((a, b) => b[1] - a[1]).map(([k, n]) => k ? `<button class="chip ${f.who === k ? 'on' : ''}" data-act="calWho" data-w="${esc(k)}">${esc(k)} (${n})</button>` : `<span class="muted sm">Sin encargado (${n})</span>`).join(' ');
+  const arows = acts.slice(0, 30).map(e => { const n = daysTo(e.date); return `<tr class="click" data-act="openTicket" data-id="${e.t.id}"><td class="num" style="white-space:nowrap"><b>${fmtDue(e.date)}</b></td><td><span class="pill ${n === 0 ? 'p-cliente' : 'p-grey'}">${n === 0 ? 'hoy' : `en ${n} d`}</span></td><td>${tagT(e.t.type)} <b>#${e.t.id}</b> <span class="muted sm">${esc(trunc(e.t.client || '', 16))}</span></td><td>${esc(trunc(e.label, 70))}</td><td>${esc(e.area || '—')}</td><td>${esc(e.who || '—')}</td><td class="muted sm">${KIND_LABEL[e.kind]}</td></tr>`; }).join('');
+  const mrows = miss.slice(0, 60).map(t => `<tr><td style="white-space:nowrap">${tagT(t.type)} <a href="#" data-act="openTicket" data-id="${t.id}"><b>#${t.id}</b></a></td><td>${esc(t.client || '—')}</td><td>${esc(trunc(tplVars(t).asunto, 50))}</td><td>${t.dateAsked ? `<span class="pill p-cliente">pedida ${ago(t.dateAsked)}</span>` : `<button class="btn sm" data-act="markAsked" data-id="${t.id}">Marcar pedida</button>`}</td><td style="width:140px"><input type="date" data-ch="delivery" data-id="${t.id}" title="Fecha de entrega"></td></tr>`).join('');
+  return `<div class="page" style="max-width:1400px"><div style="margin-bottom:12px"><h1>Calendario</h1><div class="muted">Entregas, hitos y tareas de todos los tickets, con su área y encargado. Las fechas salen de Zendesk, del plan de cada ticket y de los pasos de Seguimiento.</div></div>
+    <div class="fbar" style="margin-bottom:12px"><button class="btn" data-act="calNav" data-n="-1">‹</button><b style="min-width:150px;text-align:center">${esc(cap(title))}</b><button class="btn" data-act="calNav" data-n="1">›</button><button class="btn" data-act="calNav" data-n="0">Hoy</button><span class="muted">|</span>${chips}<span class="muted">|</span>
+      ${sel('area', allAreas(), 'Todas las áreas')}${sel('who', allWho(), 'Todos los encargados')}<span class="muted">|</span>
+      <label class="row sm"><input type="checkbox" data-ch="calOpt" data-k="hitos" ${f.hitos ? 'checked' : ''}> Hitos y entregables</label><label class="row sm"><input type="checkbox" data-ch="calOpt" data-k="tareas" ${f.tareas ? 'checked' : ''}> Tareas</label><label class="row sm"><input type="checkbox" data-ch="calOpt" data-k="rem" ${f.rem ? 'checked' : ''}> Recordatorios</label></div>
+    <div class="cal">${cells}</div>
+    <div class="legend muted sm"><span class="ev ev-entrega" style="background:var(--pry)">Entrega</span> <span class="ev ev-entregable">Entregable</span> <span class="ev ev-hito">Hito</span> <span class="ev ev-tarea">Tarea (área · encargado)</span> <span class="ev ev-rem">Recordatorio</span></div>
+    <div class="card" style="margin-bottom:16px"><div class="row sp" style="margin-bottom:8px;flex-wrap:wrap"><h3>Actividades de los próximos 30 días (${acts.length})</h3><div class="row wrap">${loadChips}${f.who || f.area ? '<button class="btn sm" data-act="calClear">Quitar filtros</button>' : ''}</div></div>
+      ${acts.length ? `<table class="tb"><thead><tr><th>Fecha</th><th></th><th>Ticket</th><th>Actividad</th><th>Área</th><th>Encargado</th><th>Tipo</th></tr></thead><tbody>${arows}</tbody></table>${acts.length > 30 ? `<div class="muted sm" style="margin-top:6px">Se muestran 30 de ${acts.length}.</div>` : ''}` : '<div class="muted">No hay actividades con estos filtros. Agrégalas en la pestaña Gantt de cada ticket.</div>'}</div>
+    <div class="calgrid"><div class="card"><h3 style="margin-bottom:8px">Próximas entregas</h3>${prox ? `<table class="tb"><tbody>${prox}</tbody></table>` : '<div class="muted">No hay entregas con fecha para estos filtros.</div>'}</div>
+    <div class="card"><div class="row sp" style="margin-bottom:8px"><h3>${f.types.length ? '' : 'Proyectos '}sin fecha de entrega (${miss.length})</h3>${miss.length ? `<div class="row"><button class="btn sm pri" data-act="copyAskDate">${ic('copy', 13)} Copiar mensaje para ${esc((S.settings.dateOwner || '').split(' ')[0])}</button><button class="btn sm" data-act="markAskedAll">Marcar todas pedidas</button></div>` : ''}</div>
+      ${miss.length ? `<table class="tb"><tbody>${mrows}</tbody></table>${miss.length > 60 ? `<div class="muted sm" style="margin-top:6px">Se muestran 60 de ${miss.length}.</div>` : ''}` : '<div class="muted">Todos tienen fecha de entrega.</div>'}
+      <div class="muted sm" style="margin-top:8px">Si la escribes aquí se guarda solo en esta web. Para que quede en Zendesk, complétala allí y se actualizará sola.</div></div></div></div>`;
+}
+
+/* ================= DASHBOARDS: vistas editables ================= */
+const KPIS = [['total', 'Tickets'], ['espCliente', 'Esperando cliente'], ['atencion', 'Requieren atención'], ['entr7', 'Entregas en ≤ 7 días'], ['entrLate', 'Entregas atrasadas'], ['sinFecha', 'Sin fecha de entrega'], ['hitos14', 'Hitos y entregables en ≤ 14 días'], ['tareasLate', 'Tareas vencidas']];
+const DEF_KPIS = ['total', 'atencion', 'entr7', 'entrLate', 'sinFecha', 'tareasLate'];
+const DEF_VIEW = () => ({ level: 'proyecto', cols: {}, kpis: DEF_KPIS.slice(), hidePast: true });
+function viewOf(d) {
+  const v = d ? (d.view = d.view || DEF_VIEW()) : (S.viewAll = S.viewAll || DEF_VIEW());
+  v.cols = v.cols || {}; v.kpis = v.kpis || DEF_KPIS.slice();
+  return v;
+}
+const curDash = () => UI.route.id === 'all' ? null : findDash(UI.route.id);
+const curView = () => viewOf(curDash());
+const LEVELS = [['proyecto', 'Todo el proyecto'], ['hitos', 'Hitos'], ['entregables', 'Entregables'], ['tareas', 'Tareas del equipo']];
+const LEVEL_KIND = { hitos: 'hito', entregables: 'entregable', tareas: 'tarea' };
+function itemProg(t, kind) {
+  const its = ticketItems(t).filter(i => i.kind === kind); if (!its.length) return '<span class="muted">—</span>';
+  return `${its.filter(i => ['Hecho', 'Pasado'].includes(itemState(i))).length}/${its.length}`;
+}
+function taskProg(t) {
+  const its = ticketItems(t).filter(i => i.kind === 'tarea' && !i.done); if (!its.length) return '<span class="muted">—</span>';
+  const late = its.filter(i => itemState(i) === 'Vencido').length;
+  return `${its.length}${late ? ` <span style="color:var(--red);font-weight:600">(${late} venc.)</span>` : ''}`;
+}
+const PCOLS = [
+  ['tipo', 'Tipo', t => tagT(t.type)],
+  ['num', '#', t => `<b>#${t.id}</b>`, 'num'],
+  ['asunto', 'Asunto', t => esc(t.subject), '', 'max-width:340px'],
+  ['cliente', 'Cliente', t => esc(t.client || '—')],
+  ['zd', 'Zendesk', t => stDot(t.zdStatus) + esc(t.zdStatus)],
+  ['estado', 'Estado interno', t => { const st = statusOf(t); return `<span class="pill ${st === 'Esperando cliente' ? 'p-cliente' : st === 'Cerrado' ? 'p-grey' : 'p-inference'}">${esc(st)}</span>`; }],
+  ['rep', 'Estado del reporte', t => `<span class="st-dot" style="background:${repColor(repEstado(t))}"></span>${esc(repEstado(t))}`],
+  ['siguiente', 'Siguiente paso', t => { const ns = nextStep(t); return ns ? esc(trunc(ns.text, 90)) : '<span class="muted">—</span>'; }, '', 'max-width:300px'],
+  ['resp', 'Resp.', t => { const ns = nextStep(t); return ns ? ownP(ns.owner) : ''; }],
+  ['vence', 'Vence', t => { const ns = nextStep(t); return ns ? fmtDue(ns.due) : ''; }, 'num'],
+  ['entrega', 'Entrega', entregaCell, 'num'],
+  ['hitos', 'Hitos', t => itemProg(t, 'hito'), 'num'],
+  ['entregables', 'Entregables', t => itemProg(t, 'entregable'), 'num'],
+  ['tareas', 'Tareas abiertas', taskProg, 'num'],
+  ['slack', 'Slack', t => t.slackId ? `<span class="muted" title="${esc(t.slackName)}">${ic('hash', 14)}</span>` : '<span class="muted" title="Sin canal vinculado">—</span>'],
+  ['flags', 'Alertas', flagsHTML],
+  ['act', 'Actividad', t => `<span class="muted sm">${ago(lastActivity(t))}</span>`],
+];
+const PCOLS_DEF = ['tipo', 'num', 'asunto', 'cliente', 'zd', 'estado', 'siguiente', 'resp', 'vence', 'entrega', 'slack', 'flags', 'act'];
+const diasTxt = i => { const n = daysTo(i.end); return n < 0 ? `hace ${-n} d` : n === 0 ? 'hoy' : `en ${n} d`; };
+const ICOLS = [
+  ['tipo', 'Tipo', i => tagT(i.t.type)],
+  ['num', '#', i => `<b>#${i.t.id}</b>`, 'num'],
+  ['asunto', 'Ticket', i => esc(trunc(tplVars(i.t).asunto, 60))],
+  ['cliente', 'Cliente', i => esc(i.t.client || '—')],
+  ['item', 'Ítem', i => `${esc(i.title)}${i.main ? ' <span class="pill p-grey">entrega final</span>' : ''}`],
+  ['inicio', 'Inicio', i => fmtDue(i.start), 'num'],
+  ['fin', 'Fin', i => fmtDue(i.end), 'num'],
+  ['dias', 'Faltan', i => diasTxt(i), 'num'],
+  ['estado', 'Estado', i => statePill(itemState(i))],
+  ['area', 'Área', i => esc(i.area || '—')],
+  ['who', 'Encargado', i => esc(i.who || '—')],
+  ['fuente', 'Fuente', i => ({ zendesk: 'Zendesk', manual: 'Manual', plan: 'Plan', paso: 'Seguimiento' })[i.src]],
+];
+const colsOf = v => v.cols[v.level] || (v.level === 'proyecto' ? PCOLS_DEF : ICOLS.map(c => c[0]));
+function kpiVal(k, l, its) {
+  switch (k) {
+    case 'total': return [l.length, 0];
+    case 'espCliente': return [l.filter(t => statusOf(t) === 'Esperando cliente').length, 0];
+    case 'atencion': { const n = l.filter(needsAttention).length; return [n, n]; }
+    case 'entr7': return [l.filter(t => { const d = deliveryOf(t), n = d && daysTo(d.date); return d && n >= 0 && n <= 7; }).length, 0];
+    case 'entrLate': { const n = l.filter(t => { const d = deliveryOf(t); return d && daysTo(d.date) < 0; }).length; return [n, n]; }
+    case 'sinFecha': return [l.filter(t => !deliveryOf(t)).length, 0];
+    case 'hitos14': return [its.filter(i => (i.kind === 'hito' || i.kind === 'entregable') && daysTo(i.end) >= 0 && daysTo(i.start) <= 14).length, 0];
+    case 'tareasLate': { const n = its.filter(i => i.kind === 'tarea' && itemState(i) === 'Vencido').length; return [n, n]; }
+  }
+  return [0, 0];
+}
+function dashView() {
+  const id = UI.route.id, d = id === 'all' ? null : findDash(id), f = d ? d.filters : UI.fAll, v = viewOf(d);
+  const list = filterTickets(f), its = list.flatMap(ticketItems);
+  const clients = [...new Set(Object.values(S.tickets).map(t => t.client).filter(Boolean))].sort();
+  const tree = `<aside class="tree"><h3><span>Dashboards</span><button class="ibtn" data-act="newFolder" title="Nueva carpeta">${ic('plus', 15)}</button></h3>
+    <div class="tn ${id === 'all' ? 'on' : ''}" data-act="selectDash" data-id="all">${ic('layout', 15)}<span>Todos los tickets</span><span class="c">${Object.keys(S.tickets).length}</span></div>
+    ${S.folders.map(fo => `<div class="tn f" data-act="toggleFolder" data-id="${fo.id}"><span class="chev ${fo.open ? '' : 'closed'}">${ic('chev', 14)}</span>${ic('folder', 15)}<span>${esc(fo.name)}</span><span class="acts">
+        <button class="ibtn" data-act="newDash" data-id="${fo.id}" title="Nuevo dashboard">${ic('plus', 14)}</button><button class="ibtn" data-act="renFolder" data-id="${fo.id}" title="Renombrar">${ic('edit', 14)}</button><button class="ibtn" data-act="delFolder" data-id="${fo.id}" title="Eliminar">${ic('trash', 14)}</button></span></div>
+      ${fo.open ? fo.dashboards.map(da => `<div class="tn d ${id === da.id ? 'on' : ''}" data-act="selectDash" data-id="${da.id}"><span>${esc(da.name)}</span><span class="c">${filterTickets(da.filters).length}</span><span class="acts"><button class="ibtn" data-act="renDash" data-id="${da.id}" title="Renombrar">${ic('edit', 14)}</button><button class="ibtn" data-act="delDash" data-id="${da.id}" title="Eliminar">${ic('trash', 14)}</button></span></div>`).join('') : ''}`).join('')}
+    </aside>`;
+  const chips = ['pry', 'evo', 'dt'].map(k => `<button class="chip ${(f.types || []).includes(k) ? 'on' : ''}" data-act="dfType" data-t="${k}">${TYPES[k]}</button>`).join('');
+  const sel = (k, opts, ph) => `<select data-ch="dfilter" data-k="${k}"><option value="">${ph}</option>${opts.map(o => `<option value="${esc(o[0])}" ${f[k] === o[0] ? 'selected' : ''}>${esc(o[1])}</option>`).join('')}</select>`;
+  const itemLevel = v.level !== 'proyecto';
+  const bar = `<div class="fbar">${chips}
+    ${sel('status', STATUSES.map(s => [s, s]), 'Estado interno')}${sel('client', clients.map(c => [c, c]), 'Cliente')}
+    ${sel('owner', [['cliente', 'Siguiente paso: Cliente'], ['inference', 'Siguiente paso: Inference']], 'Responsable')}${sel('slack', [['linked', 'Con Slack'], ['unlinked', 'Sin Slack']], 'Slack')}
+    ${itemLevel ? sel('area', allAreas().map(a => [a, a]), 'Área') + sel('who', allWho().map(a => [a, a]), 'Encargado') : ''}
+    <label class="row sm"><input type="checkbox" data-ch="dfilter" data-k="attention" ${f.attention ? 'checked' : ''}> Requieren atención</label>
+    <input type="text" data-ch="dfilter" data-k="q" placeholder="Buscar #, asunto, cliente…" value="${esc(f.q || '')}"></div>`;
+  const levelBar = `<div class="fbar" style="margin-bottom:8px">${LEVELS.map(l => `<button class="chip ${v.level === l[0] ? 'on' : ''}" data-act="viewLevel" data-l="${l[0]}">${l[1]}</button>`).join('')}<button class="btn sm" data-act="viewEdit">${ic('edit', 13)} Editar vista</button></div>`;
+  let table, count;
+  if (!itemLevel) {
+    const cols = PCOLS.filter(c => colsOf(v).includes(c[0]));
+    count = `${list.length} ticket(s)`;
+    table = list.length ? `<table class="tb"><thead><tr>${cols.map(c => `<th>${c[1]}</th>`).join('')}</tr></thead><tbody>${list.map(t => `<tr class="click" data-act="openTicket" data-id="${t.id}">${cols.map(c => `<td class="${c[3] || ''}" ${c[4] ? `style="${c[4]}"` : ''}>${c[2](t)}</td>`).join('')}</tr>`).join('')}</tbody></table>` :
+      `<div class="empty">${Object.keys(S.tickets).length ? 'Ningún ticket coincide con este dashboard.' : 'Aún no hay tickets. Pulsa «Actualizar» para traerlos de Zendesk.'}</div>`;
+  } else {
+    let rows = its.filter(i => i.kind === LEVEL_KIND[v.level]);
+    if (f.area) rows = rows.filter(i => i.area === f.area);
+    if (f.who) rows = rows.filter(i => i.who === f.who);
+    if (v.hidePast) rows = rows.filter(i => !['Hecho', 'Pasado'].includes(itemState(i)));
+    rows.sort((a, b) => a.start.localeCompare(b.start) || a.end.localeCompare(b.end));
+    const cols = ICOLS.filter(c => colsOf(v).includes(c[0]));
+    count = `${rows.length} ${LEVELS.find(l => l[0] === v.level)[1].toLowerCase()} · ${list.length} ticket(s)`;
+    table = rows.length ? `<table class="tb"><thead><tr>${cols.map(c => `<th>${c[1]}</th>`).join('')}</tr></thead><tbody>${rows.map(i => `<tr class="click" data-act="openTicket" data-id="${i.t.id}">${cols.map(c => `<td class="${c[3] || ''}">${c[2](i)}</td>`).join('')}</tr>`).join('')}</tbody></table>` :
+      `<div class="empty">No hay ${LEVELS.find(l => l[0] === v.level)[1].toLowerCase()} con estos filtros.${v.hidePast ? ' Se ocultan los que ya pasaron (se cambia en «Editar vista»).' : ''}</div>`;
+  }
+  const kp = v.kpis.map(k => { const [n, bad] = kpiVal(k, list, its), lb = (KPIS.find(x => x[0] === k) || [0, k])[1]; return `<div class="kpi ${bad ? 'bad' : ''}"><b>${n}</b><span>${esc(lb)}</span></div>`; }).join('');
+  return `<div class="split">${tree}<section class="content"><div class="dhead"><h2>${d ? esc(d.name) : 'Todos los tickets'} <span class="muted" style="font-weight:400;font-size:13px">· ${count}</span></h2>${levelBar}${bar}</div>
+    ${kp ? `<div class="kpis">${kp}</div>` : ''}${table}</section></div>`;
+}
+function viewEditor() {
+  const d = curDash(), v = viewOf(d), defs = v.level === 'proyecto' ? PCOLS : ICOLS, cur = colsOf(v);
+  openModal(`<div class="row sp"><h2>Editar vista${d ? ' · ' + esc(d.name) : ' · Todos los tickets'}</h2><button class="btn pri" data-act="closeModal">Listo</button></div>
+    <label class="lb">Qué quieres ver</label>
+    <div class="row wrap" style="gap:16px">${LEVELS.map(l => `<label class="row"><input type="radio" name="vlevel" data-ch="viewLevel" value="${l[0]}" ${v.level === l[0] ? 'checked' : ''}> ${l[1]}</label>`).join('')}</div>
+    <div class="muted sm" style="margin-top:4px">Todo el proyecto = una fila por ticket. Hitos, entregables y tareas = una fila por cada uno, con su fecha, área y encargado.</div>
+    <label class="lb">Columnas</label><div class="vgrid">${defs.map(c => `<label class="row"><input type="checkbox" data-ch="viewCol" data-k="${c[0]}" ${cur.includes(c[0]) ? 'checked' : ''}> ${c[1]}</label>`).join('')}</div>
+    <label class="lb">Indicadores sobre la tabla</label><div class="vgrid">${KPIS.map(k => `<label class="row"><input type="checkbox" data-ch="viewKpi" data-k="${k[0]}" ${v.kpis.includes(k[0]) ? 'checked' : ''}> ${k[1]}</label>`).join('')}</div>
+    ${v.level !== 'proyecto' ? `<label class="row" style="margin-top:14px"><input type="checkbox" data-ch="viewHide" ${v.hidePast ? 'checked' : ''}> Ocultar los que ya pasaron o están hechos</label>` : ''}
+    <div class="muted sm" style="margin-top:12px">Los cambios se aplican al momento y se guardan en este dashboard.</div>`);
+}
 
 /* =====================================================================
    ACCIONES
@@ -1004,7 +1512,7 @@ const validDate = s => /^\d{4}-\d{2}-\d{2}$/.test(String(s || '')) ? s : '';
 function pushStep(t, type, x, src) {
   const text = String(x.texto || '').trim(); if (!text) return false;
   if ((t.steps || []).some(s => !s.done && norm(s.text) === norm(text))) return false;
-  t.steps.push({ id: uid(), type, text, owner: x.responsable === 'cliente' ? 'cliente' : 'inference', due: validDate(x.vence), done: false, src });
+  t.steps.push({ id: uid(), type, text, owner: x.responsable === 'cliente' ? 'cliente' : 'inference', due: validDate(x.vence), start: '', area: String(x.area || '').trim(), who: String(x.encargado || '').trim(), done: false, src });
   return true;
 }
 
@@ -1022,9 +1530,17 @@ const ACT = {
   logout: () => { if (confirm('¿Cerrar sesión? Se borra de este navegador la caché de mensajes; tus pendientes y notas se conservan.')) logout('Sesión cerrada.'); },
   nav: d => go(d.v, d.id),
   bell: () => { UI.bell = !UI.bell; render(); },
-  alertGo: d => { const a = S.notifications.find(x => x.id === d.aid); if (a) a.read = true; save(); UI.bell = false; d.id && S.tickets[d.id] ? go('ticket', d.id) : go('daily'); },
+  alertGo: d => { const a = S.notifications.find(x => x.id === d.aid); if (a) a.read = true; save(); UI.bell = false; d.id && S.tickets[d.id] ? go('ticket', d.id) : go(a && a.kind === 'cal' ? 'cal' : 'daily'); },
   alertsRead: () => { S.notifications.forEach(a => a.read = true); save(); render(); },
-  openTicket: d => go('ticket', d.id),
+  openTicket: d => { $('#modal').innerHTML = ''; go('ticket', d.id); },
+  calNav: d => { const c = UI.cal, n = +d.n; if (!n) { c.y = new Date().getFullYear(); c.m = new Date().getMonth(); } else { const x = new Date(c.y, c.m + n, 1); c.y = x.getFullYear(); c.m = x.getMonth(); } render(); },
+  calType: d => { const c = UI.cal; c.types = c.types.includes(d.t) ? c.types.filter(x => x !== d.t) : [...c.types, d.t]; render(); },
+  calDay: d => { const list = calEvents(UI.cal).filter(e => e.date === d.d).sort((a, b) => KORD[a.kind] - KORD[b.kind]); openModal(`<div class="row sp"><h2>${esc(fmtDue(d.d))}</h2><button class="btn" data-act="closeModal">Cerrar</button></div><div style="margin-top:10px">${list.map(evChip).join('')}</div>`); },
+  markAsked: d => { T_(d.id).dateAsked = Date.now(); save(); render(); },
+  markAskedAll: () => { missingDelivery(calMissTypes()).forEach(t => { if (!t.dateAsked) t.dateAsked = Date.now(); }); save(); render(); },
+  copyAskDate: () => copy(askDateMessage(missingDelivery(calMissTypes()))),
+  calWho: d => { UI.cal.who = UI.cal.who === d.w ? '' : d.w; render(); },
+  calClear: () => { UI.cal.who = ''; UI.cal.area = ''; render(); },
   closeTab: d => { UI.tabs = UI.tabs.filter(x => x !== d.id); if (UI.route.v === 'ticket' && UI.route.id === d.id) UI.route = { v: 'dash', id: 'all' }; render(); },
   refresh: () => { UI.forceMeta = true; syncAll(); },
   refreshOne: async d => { const t = T_(d.id); try { await refreshTicket(d.id, true); if (t.slackId) await refreshSlack(t); } catch (e) { toast(e.message, 'err'); } save(); render(); },
@@ -1047,7 +1563,7 @@ const ACT = {
   addStep: d => {
     const t = T_(d.id), text = $('#ns_text').value.trim(); if (!text) return toast('Escribe la descripción', 'err');
     const date = $('#ns_date').value, time = $('#ns_time').value;
-    t.steps.push({ id: uid(), type: $('#ns_type').value, text, owner: $('#ns_owner').value, due: date ? (time ? `${date}T${time}` : date) : '', done: false, src: 'manual' });
+    t.steps.push({ id: uid(), type: $('#ns_type').value, text, owner: $('#ns_owner').value, due: date ? (time ? `${date}T${time}` : date) : '', start: ($('#ns_start') || {}).value || '', area: ($('#ns_area') || {}).value || '', who: (($('#ns_who') || {}).value || '').trim(), done: false, src: 'manual' });
     save(); render();
   },
   delStep: d => { const t = T_(d.id); t.steps = t.steps.filter(s => s.id !== d.sid); save(); render(); },
@@ -1126,9 +1642,65 @@ const ACT = {
   exportData: () => { const o = { settings: { ...S.settings } }; KV_KEYS.forEach(k => o[k] = S[k]); download(`pm-hub-${isoDay(new Date())}.json`, JSON.stringify(o, null, 1), 'application/json'); },
   kvPush: () => kvPush(true),
   kvPull: () => kvPull(),
+  /* v1.5 · status, gantt, vistas, usuarios */
+  stType: d => { const s = UI.st; s.types = s.types.includes(d.t) ? s.types.filter(x => x !== d.t) : [...s.types, d.t]; render(); },
+  stEdit: () => { UI.st.edit = !UI.st.edit; render(); },
+  stPrint: () => { UI.st.edit = false; render(); setTimeout(() => window.print(), 150); },
+  stFill: async () => {
+    const { list } = statusList(); let n = 0;
+    for (const t of list) { const r = repOf(t), d = repDerived(t); if (!r.sit && d.sit) { r.sit = d.sit; n++; } if (!r.next && d.next) { r.next = d.next; n++; } if (!r.area && d.area) { r.area = d.area; n++; } if (!r.resp && d.resp) { r.resp = d.resp; n++; } }
+    save(); render(); toast(n ? `${n} campo(s) completados con lo que ya hay en Seguimiento y Zendesk` : 'No había nada que completar');
+  },
+  stCopy: async () => {
+    const { cl, list } = statusList(), m = UI.st.month;
+    const rows = list.map(t => { const r = repOf(t), d = repDerived(t), e = repHoursEst(t); return [t.id, tplVars(t).asunto, r.area || d.area, repEstado(t), r.resp || d.resp, e === '' ? 'Por definir' : fmtH(e), fmtH(r.hours[m] || 0), r.sit || d.sit, r.next || d.next]; });
+    const th = ['N°', 'Requerimiento', 'Área / Impacto', 'Estado', 'Responsable / Dependencia', 'Horas estimadas', 'Horas utilizadas este mes', 'Situación actual', 'Próxima acción'];
+    const html = `<table border="1" cellpadding="4" style="border-collapse:collapse;font-family:Arial;font-size:12px"><tr>${th.map(x => `<th>${x}</th>`).join('')}</tr>${rows.map(r => `<tr>${r.map(c => `<td>${esc(c)}</td>`).join('')}</tr>`).join('')}</table>`;
+    const txt = [th.join('\t'), ...rows.map(r => r.join('\t'))].join('\n');
+    try { await navigator.clipboard.write([new ClipboardItem({ 'text/html': new Blob([html], { type: 'text/html' }), 'text/plain': new Blob([txt], { type: 'text/plain' }) })]); toast('Tabla copiada'); }
+    catch { copy(txt); }
+  },
+  repAI: async d => {
+    const t = T_(d.id); UI.busy['ai' + t.id] = true; render();
+    try {
+      const o = parseJSON(await ai('Eres el asistente de un Project Manager. Con los datos del ticket devuelve solo JSON: {"situacion":"situación actual en 1-2 frases, para un reporte al cliente","proxima":"próxima acción concreta, con responsable y fecha si existe"}. No inventes datos.', `Hoy es ${todayStr()}.\n` + ctxTicket(t, 4000, 2500)));
+      const r = repOf(t); if (o.situacion) r.sit = String(o.situacion); if (o.proxima) r.next = String(o.proxima); save();
+    } catch (e) { toast('IA: ' + e.message, 'err'); }
+    UI.busy['ai' + t.id] = false; render();
+  },
+  gz: d => { UI.gz = Math.max(0.4, Math.min(4, UI.gz * (+d.n > 0 ? 1.4 : 1 / 1.4))); const g = $('.gantt'), x = g ? g.scrollLeft : 0; render(); const g2 = $('.gantt'); if (g2) { g2.dataset.done = 1; g2.scrollLeft = x; } },
+  addPlan: d => {
+    const t = T_(d.id), text = $('#pl_text').value.trim(), start = $('#pl_start').value, end = $('#pl_end').value || start;
+    if (!text || !start) return toast('Escribe el nombre y la fecha de inicio', 'err');
+    (t.plan = t.plan || []).push({ id: uid(), kind: $('#pl_kind').value, text, area: $('#pl_area').value, who: $('#pl_who').value.trim(), start, end: end < start ? start : end, done: false });
+    save(); render();
+  },
+  delPlan: d => { const t = T_(d.id); t.plan = (t.plan || []).filter(p => p.id !== d.pid); save(); render(); },
+  viewEdit: () => viewEditor(),
+  viewLevel: d => { curView().level = d.l; save(); render(); },
+  genUser: () => {
+    const u = norm((($('#nu_user') || {}).value || '').trim()).replace(/\s+/g, '.').replace(/[^a-z0-9._-]/g, '');
+    if (!u) return toast('Escribe un usuario (letras y números)', 'err');
+    UI.nu = { user: u, pass: genPass(20) }; render();
+  },
 };
 
 const CH = {
+  repField: el => { const r = repOf(T_(el.dataset.id)); r[el.dataset.k] = el.value; save(); render(); },
+  repHours: el => { const r = repOf(T_(el.dataset.id)); if (el.value === '') delete r.hours[UI.st.month]; else r.hours[UI.st.month] = parseFloat(el.value) || 0; save(); render(); },
+  cfgField: el => { cfgOf(el.dataset.c)[el.dataset.k] = el.value; save(); render(); },
+  stSel: el => { UI.st[el.dataset.k] = el.value; render(); },
+  stChk: el => { UI.st.closed = el.checked; render(); },
+  planDone: el => { const p = (T_(el.dataset.id).plan || []).find(x => x.id === el.dataset.pid); if (p) p.done = el.checked; save(); render(); },
+  planField: el => { const p = (T_(el.dataset.id).plan || []).find(x => x.id === el.dataset.pid); if (p) p[el.dataset.k] = el.value.trim(); save(); render(); },
+  stepField: el => { const s = (T_(el.dataset.id).steps || []).find(x => x.id === el.dataset.sid); if (s) s[el.dataset.k] = el.value.trim(); save(); render(); },
+  viewLevel: el => { curView().level = el.value; save(); viewEditor(); render(); },
+  viewCol: el => { const v = curView(), cur = colsOf(v).slice(); v.cols[v.level] = el.checked ? [...cur, el.dataset.k] : cur.filter(x => x !== el.dataset.k); save(); render(); },
+  viewKpi: el => { const v = curView(); v.kpis = el.checked ? [...v.kpis, el.dataset.k] : v.kpis.filter(x => x !== el.dataset.k); save(); render(); },
+  viewHide: el => { curView().hidePast = el.checked; save(); render(); },
+  calSel: el => { UI.cal[el.dataset.k] = el.value; render(); },
+  delivery: el => { const t = T_(el.dataset.id); t.deliveryManual = el.value || ''; save(); render(); },
+  calOpt: el => { UI.cal[el.dataset.k] = el.checked; render(); },
   dfilter: el => { const d = UI.route.id === 'all' ? null : findDash(UI.route.id), f = d ? d.filters : UI.fAll; f[el.dataset.k] = el.type === 'checkbox' ? el.checked : el.value; save(); render(); },
   linkSlack: el => { const t = T_(el.dataset.id), c = C.channels.find(x => x.id === el.value); if (!c) return; Object.assign(t, { slackId: c.id, slackName: c.name, slackAuto: false, slackManualOff: false, lastSlackTs: '0' }); save(); render(); refreshSlack(t).then(() => { save(); render(); }).catch(e => toast(e.message, 'err')); },
   internal: el => { T_(el.dataset.id).internal = el.value; save(); render(); },
