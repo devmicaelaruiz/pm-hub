@@ -4,7 +4,7 @@
    Web estática (GitHub Pages) + proxy Cloudflare Worker (Zendesk, Slack, IA)
    ===================================================================== */
 
-const VERSION = 'v1.5 · status, gantt y vistas';
+const VERSION = 'v1.6 · usuarios, equipo e IA automática';
 
 /* ---------- utilidades ---------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -95,11 +95,11 @@ function defaults() {
       workerUrl: '', pollSec: 60, slackPollSec: 120,
       keywords: 'evolutivo, deuda técnica, proyecto', internalDomains: 'inferencelabs9.com',
       myName: '', dailyTime: '17:30', staleDays: 2, leadMin: 60, replyHours: 4,
-      notif: true, includeSolved: false, syncKV: false, autoDates: true, dateOwner: 'Giancarlo Guzmán',
+      notif: true, includeSolved: false, syncKV: true, autoAI: true, aiPerHour: 14, autoDates: true, dateOwner: 'Giancarlo Guzmán',
       areas: 'Tecnología, Operaciones, QA, Proyectos, Comercial, Cliente', provider: 'Inference Labs9',
     },
     folders: [{ id: 'f1', name: 'Mis dashboards', open: true, dashboards: [{ id: 'd1', name: 'Pendientes de respuesta', filters: { types: [], q: '', status: '', client: '', owner: '', slack: '', attention: true } }] }],
-    tickets: {}, archive: [], clientCfg: {}, viewAll: null, notifications: [], notified: {}, templates: defaultTemplates(), lastDaily: '', lastSync: 0,
+    tickets: {}, archive: [], clientCfg: {}, viewAll: null, gone: {}, log: [], notifications: [], notified: {}, templates: defaultTemplates(), lastDaily: '', lastSync: 0,
   };
 }
 const loadJSON = (k, def) => { try { const v = JSON.parse(localStorage.getItem(k)); return v || def; } catch { return def; } };
@@ -130,7 +130,7 @@ async function login(url, user, password, remember) {
   catch { throw new Error('No se pudo conectar con el Worker. Revisa la URL.'); }
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || ('Error ' + r.status));
-  localStorage.setItem(SESS, JSON.stringify({ token: j.token, exp: j.exp, user: j.user }));
+  localStorage.setItem(SESS, JSON.stringify({ token: j.token, exp: j.exp, user: j.user, role: j.role || 'editor' }));
   S.settings.workerUrl = url; save();
 }
 function logout(msg) {
@@ -151,7 +151,7 @@ async function api(path, opts = {}) {
   let j; try { j = JSON.parse(txt); } catch { j = { raw: txt }; }
   if (!r.ok) {
     if (r.status === 401) logout('Tu sesión venció. Inicia sesión de nuevo.');
-    const e = new Error(j.error || j.msg || txt.slice(0, 200) || ('HTTP ' + r.status)); e.status = r.status; e.retry = j.retry_after; throw e;
+    const e = new Error(j.error || j.msg || txt.slice(0, 200) || ('HTTP ' + r.status)); e.status = r.status; e.retry = j.retry_after; e.body = j; throw e;
   }
   return j;
 }
@@ -174,24 +174,8 @@ function parseJSON(txt) {
 }
 
 /* ---------- sincronización opcional con KV ---------- */
-let kvT = null;
 const KV_KEYS = ['folders', 'tickets', 'archive', 'templates', 'notified', 'lastDaily', 'clientCfg', 'viewAll'];
-function kvSoon() { if (!S.settings.syncKV || !configured()) return; clearTimeout(kvT); kvT = setTimeout(kvPush, 120000); }
-async function kvPush(manual) {
-  try {
-    const o = {}; KV_KEYS.forEach(k => o[k] = S[k]);
-    await api('/state', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(o) });
-    if (manual) toast('Datos subidos a la nube (KV)');
-  } catch (e) { toast('KV: ' + e.message, 'err'); }
-}
-async function kvPull() {
-  try {
-    const o = await api('/state');
-    if (!o || !o.tickets) return toast('No hay datos guardados en KV', 'err');
-    KV_KEYS.forEach(k => { if (o[k] !== undefined) S[k] = o[k]; });
-    save(); render(); toast('Datos descargados de KV');
-  } catch (e) { toast('KV: ' + e.message, 'err'); }
-}
+/* kvSoon / syncShared viven en p5.js (datos compartidos entre usuarios) */
 
 /* ---------- parsing de Zendesk ---------- */
 function typeOf(form, subj) {
@@ -292,7 +276,7 @@ function derivedStatus(t) {
   if (!last) return 'En Inference';
   return last.side === 'cliente' ? 'En Inference' : 'Esperando cliente';
 }
-const statusOf = t => t.internal || derivedStatus(t);
+const statusOf = t => t.internal || aiStatus(t) || derivedStatus(t);
 function openSteps(t) { return (t.steps || []).filter(s => !s.done); }
 function nextStep(t) {
   const a = openSteps(t);
@@ -392,7 +376,7 @@ function autoDates(t) {
   for (const d of detectedFor(t)) {
     if (d.date < today) continue;
     t.converted[d.key] = 1;
-    t.reminders.push({ id: uid(), text: trunc(d.snip, 130), due: d.time ? `${d.date}T${d.time}` : d.date, done: false, source: `auto · ${d.src}` });
+    t.reminders.push({ id: 'a:' + hid(d.key), text: trunc(d.snip, 130), due: d.time ? `${d.date}T${d.time}` : d.date, done: false, source: `auto · ${d.src}` });
     n++;
   }
   return n;
@@ -447,6 +431,7 @@ function tick() {
       if (days >= S.settings.staleDays) alertOnce(`stale:${t.id}:${l.id}:${Math.floor(days / S.settings.staleDays)}`, t.id, 'seguimiento', `#${t.id} · sin respuesta del cliente hace ${Math.floor(days)} día(s). Toca hacer seguimiento.`);
     }
   }
+  gapDigest();
   const nod = missingDelivery(['pry']).length;
   if (nod) { const mon = new Date(now); mon.setDate(now.getDate() - ((now.getDay() + 6) % 7)); alertOnce('nodate:' + isoDay(mon), '', 'cal', `${nod} proyecto(s) sin fecha de entrega. Pídesela a ${S.settings.dateOwner} desde el Calendario.`); }
   const hhmm = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
@@ -470,7 +455,7 @@ async function pool(items, n, fn) {
   }));
 }
 function setSync(msg, err) { UI.sync = msg || ''; UI.err = err || ''; const el = $('#syncMsg'); if (el) el.innerHTML = syncHTML(); }
-async function loadHealth() { try { C.health = await api('/health'); if (C.health.base) C.base = C.health.base; } catch (e) { C.health = null; setSync('', e.message); } }
+async function loadHealth() { try { C.health = await api('/health'); if (C.health.base) C.base = C.health.base; if (C.health.kv && !S.settings.syncAsked) { S.settings.syncKV = true; S.settings.syncAsked = true; } } catch (e) { C.health = null; setSync('', e.message); } }
 
 async function syncZendesk() {
   if (!configured() || busy.zd) return;
@@ -489,6 +474,7 @@ async function syncZendesk() {
     const jobs = [], seen = new Set();
     for (const z of res.tickets) {
       const id = String(z.id); seen.add(id);
+      if (S.gone && S.gone[id]) continue;
       const prev = S.tickets[id];
       const t = prev || { id, steps: [], reminders: [], meetings: [], notes: '', ai: null, slackId: '', internal: '', converted: {}, zdSeen: '', lastSlackTs: '0' };
       const formName = (C.forms.find(f => f.id === z.ticket_form_id) || {}).name || '';
@@ -564,13 +550,16 @@ async function refreshSlack(t) {
   autoDates(t);
   if (t.slackArchived) t.readyToClose = true;
 }
-async function syncAll() { await syncZendesk(); await syncSlack(); tick(); }
+async function syncAll() { await syncZendesk(); await syncSlack(); tick(); setTimeout(syncShared, 500); setTimeout(autoTick, 4000); }
 let TM = {};
 function startTimers() {
   Object.values(TM).forEach(clearInterval);
   TM.zd = setInterval(syncZendesk, Math.max(30, +S.settings.pollSec || 60) * 1000);
   TM.sl = setInterval(syncSlack, Math.max(60, +S.settings.slackPollSec || 120) * 1000);
   TM.tk = setInterval(tick, 60000);
+  TM.sh = setInterval(() => syncShared(), 45000);
+  TM.ai = setInterval(autoTick, 30000);
+  TM.me = setInterval(loadMe, 180000);
 }
 
 /* ---------- IA: contexto y prompts ---------- */
@@ -588,8 +577,9 @@ function ctxTicket(t, maxZ = 7000, maxS = 5000) {
     const line = `[${fmtTS(m.at)}] ${m.user}: ${m.text.slice(0, 700)}\n`;
     if ((s + line).length > maxS) break; s = line + s;
   }
-  const reg = openSteps(t).map(x => `- (${x.type}, ${x.owner}${x.due ? ', vence ' + fmtDue(x.due) : ''}) ${x.text}`).join('\n') || '(ninguno)';
-  return `TICKET #${t.id} (${TYPES[t.type]}) — ${t.subject}\nCliente: ${t.client || '?'} | Estado Zendesk: ${t.zdStatus} | Estado interno: ${statusOf(t)}\nPendientes ya registrados:\n${reg}\n\n=== ZENDESK (comentarios recientes; CLIENTE = lado del cliente, INFERENCE = nuestro equipo) ===\n${z || '(sin datos)'}\n=== SLACK interno del equipo (canal ${t.slackName || 'no vinculado'}) ===\n${s || '(sin datos)'}`;
+  const reg = openSteps(t).map((x, i) => `- [${i + 1}] (${x.type}, ${x.owner}${x.who ? ', encargado ' + x.who : ''}${x.due ? ', vence ' + fmtDue(x.due) : ''}) ${x.text}`).join('\n') || '(ninguno)';
+  const fz = zdItems(t).map(i => `${i.title}: ${i.start}${i.end !== i.start ? ' → ' + i.end : ''}`).join('; ') || '(ninguna)', dvv = deliveryOf(t);
+  return `TICKET #${t.id} (${TYPES[t.type]}) — ${t.subject}\nCliente: ${t.client || '?'} | Estado Zendesk: ${t.zdStatus} | Estado interno: ${statusOf(t)}\nFecha de entrega: ${dvv ? dvv.date : 'SIN FECHA'} | Hitos y entregas en Zendesk: ${fz}\nPendientes ya registrados (numerados):\n${reg}\n\n=== ZENDESK (comentarios recientes; CLIENTE = lado del cliente, INFERENCE = nuestro equipo) ===\n${z || '(sin datos)'}\n=== SLACK interno del equipo (canal ${t.slackName || 'no vinculado'}) ===\n${s || '(sin datos)'}`;
 }
 const ITEM = '{"texto":"","responsable":"cliente|inference","vence":"YYYY-MM-DD o null","area":"área que lo ejecuta o vacío","encargado":"persona encargada si se menciona o vacío"}';
 const SCHEMA_TICKET = `Esquema JSON: {"estado":"En Inference|Esperando cliente|Esperando proveedor|En pruebas|En espera|Bloqueado|Cerrado","resumen":"en qué estamos, máx 4 líneas","ultimo_avance":"qué cambió lo último","siguientes_pasos":[${ITEM}],"pendientes":[${ITEM}],"fechas":[{"fecha":"YYYY-MM-DD","hora":"HH:MM o null","texto":"qué ocurre ese día","fuente":"zendesk|slack"}],"alertas":["riesgos o cosas que requieren mi atención"],"respuestas":[{"titulo":"Breve","texto":"borrador de respuesta al cliente, sin firma"},{"titulo":"Formal","texto":""},{"titulo":"Pidiendo siguientes pasos","texto":""}]}. "siguientes_pasos" = acciones que vienen; "pendientes" = cosas abiertas que alguien debe entregar o resolver. Indica siempre quién es el responsable.`;
@@ -597,19 +587,8 @@ const SCHEMA_MEET = `Esquema JSON: {"resumen":"resumen en 4-6 líneas","temas":[
 
 async function analyzeTicket(t, instruction) {
   UI.busy['ai' + t.id] = true; render();
-  try {
-    const extra = (UI.extra[t.id] || '').trim();
-    const user = `Hoy es ${todayStr()}.\n\n${ctxTicket(t)}${extra ? '\n\n=== INFORMACIÓN EXTRA que pegó el PM ===\n' + extra.slice(0, 4000) : ''}\n\n${instruction ? 'Instrucción adicional del PM para las respuestas: ' + instruction + '\n\n' : ''}${SCHEMA_TICKET}`;
-    const d = parseJSON(await ai(SYS, user));
-    t.ai = { ts: Date.now(), data: d };
-    if (S.settings.autoDates) (d.fechas || []).forEach(f => {
-      const today = isoDay(new Date()), key = `ai|${f.fecha}|${f.hora || ''}|${norm(f.texto).slice(0, 24)}`;
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(f.fecha)) || f.fecha < today || t.converted[key]) return;
-      t.converted[key] = 1;
-      t.reminders.push({ id: uid(), text: String(f.texto || 'Fecha detectada'), due: /^\d{2}:\d{2}$/.test(String(f.hora)) ? `${f.fecha}T${f.hora}` : f.fecha, done: false, source: 'auto · IA' });
-    });
-    save();
-  } catch (e) { toast('IA: ' + e.message, 'err'); }
+  try { await analyzeCore(t, { instruction }); save(); }
+  catch (e) { toast('IA: ' + e.message, 'err'); }
   finally { UI.busy['ai' + t.id] = false; render(); }
 }
 
@@ -724,6 +703,7 @@ async function closeAndArchive(tid) {
 function confirmArchive(tid) {
   const t = S.tickets[tid]; const text = $('#sumText').value;
   S.archive.unshift({ id: tid, subject: t.subject, client: t.client, type: t.type, closedAt: new Date().toISOString(), summary: text });
+  (S.gone = S.gone || {})[tid] = Date.now();
   delete S.tickets[tid]; delete C.comments[tid]; delete C.slack[tid];
   UI.tabs = UI.tabs.filter(x => x !== tid); UI.route = { v: 'dash', id: 'all' };
   closeModal(); save(); render(); toast(`#${tid} archivado`);
@@ -788,7 +768,8 @@ function ticketItems(t) {
     const e = s.due.slice(0, 10);
     out.push({ id: s.id, kind: 'tarea', title: s.text, start: (s.start || e).slice(0, 10), end: e, area: s.area || '', who: s.who || '', done: !!s.done, src: 'paso', owner: s.owner });
   });
-  return out.filter(i => i.start && i.end).map(i => ({ ...i, t, start: i.start > i.end ? i.end : i.start }));
+  const ag = agentName(t);
+  return out.filter(i => i.start && i.end).map(i => ({ ...i, t, who: i.who || (i.src === 'zendesk' || i.src === 'manual' ? ag : ''), start: i.start > i.end ? i.end : i.start }));
 }
 function itemState(i) {
   const td = isoDay(new Date());
@@ -850,20 +831,20 @@ function repDerived(t) {
   const ns = nextStep(t), a = t.ai && t.ai.data;
   return {
     area: zdFieldVal(t, /^producto/) || zdFieldVal(t, /^area del cliente/),
-    resp: ns ? (ns.owner === 'cliente' ? (t.client || 'Cliente') : (S.settings.provider || 'Inference')) : '',
+    resp: (() => { const w = whoOf(t); return w.names.join(', ') + (w.dep ? (w.names.length ? ' · ' : '') + 'Depende: ' + w.dep : ''); })(),
     sit: a && a.resumen ? trunc(a.resumen, 240) : '',
-    next: ns ? `${ns.text}${ns.due ? ` (${fmtDue(ns.due)})` : ''}` : '',
+    next: ns ? `${ns.text}${ns.due ? ` (${fmtDue(ns.due)})` : ''}` : (a && a.siguientes_pasos && a.siguientes_pasos[0] ? String(a.siguientes_pasos[0].texto || '') : ''),
   };
 }
 function repEstado(t) {
-  const r = repOf(t); if (r.estado) return r.estado;
-  const st = statusOf(t);
+  const r = t.rep && t.rep.estado; if (r) return r;
+  const st = statusOf(t), td = isoDay(new Date());
   if (t.zdClosed || st === 'Cerrado') return 'Finalizado';
   if (st === 'Bloqueado') return 'Bloqueado';
-  if (st === 'En pruebas') return 'En desarrollo';
   const dev = zdItems(t).find(i => /desarroll/.test(norm(i.title)));
-  if (dev && dev.start <= isoDay(new Date())) return 'En desarrollo';
-  return 'En evaluación';
+  if (dev) { if (dev.start <= td && dev.end >= td) return 'En desarrollo'; if (dev.end < td) return 'En evaluación'; }
+  if (st === 'En pruebas' || st === 'Esperando cliente' || st === 'En espera') return 'En evaluación';
+  return t.type === 'pry' && !dev ? 'En evaluación' : 'En desarrollo';
 }
 function statusClients() { return [...new Set(Object.values(S.tickets).map(t => t.client).filter(Boolean))].sort((a, b) => a.localeCompare(b)); }
 function statusList() {
@@ -895,6 +876,7 @@ const UI = {
 
 function go(v, id) {
   UI.route = { v, id }; UI.bell = false;
+  if (v === 'settings') { loadMe(); if (isAdmin()) loadUsers(); }
   if (v === 'ticket' && !UI.tabs.includes(id)) UI.tabs.push(id);
   render();
 }
@@ -932,6 +914,7 @@ function railHTML() {
   return `<nav class="rail"><div class="logo">PM</div>
     ${b('dash', 'layout', 'Dashboards')}${b('status', 'chart', 'Status por cliente')}${b('cal', 'cal', 'Calendario: entregas, hitos y tareas')}${b('pending', 'check', 'Pendientes y siguientes pasos')}${b('daily', 'table', 'Update del día')}${b('templates', 'file', 'Plantillas')}${b('archive', 'archive', 'Archivo de cierres')}
     <div class="sp"></div>
+    <button class="avatar ${role()}" data-act="nav" data-v="settings" title="${esc(prettyUser(meName()))} · ${ROLE_LABEL[role()]}">${esc(inits(prettyUser(meName())))}</button>
     <button data-act="bell" title="Notificaciones">${ic('bell', 20)}<span class="dot" id="bellCount" style="display:none">0</span></button>
     ${b('settings', 'settings', 'Ajustes')}<button data-act="logout" title="Cerrar sesión">${ic('logout', 20)}</button></nav>`;
 }
@@ -944,7 +927,7 @@ function tabsHTML() {
     const t = S.tickets[id]; if (!t) return '';
     return `<div class="tab ${UI.route.v === 'ticket' && UI.route.id === id ? 'on' : ''}" data-act="openTicket" data-id="${id}"><span class="t">${esc(t.subject)} #${id}</span><span class="x" data-act="closeTab" data-id="${id}">${ic('x', 12)}</span></div>`;
   }).join('');
-  return `<div class="tabs">${home}${tks}<div class="grow"></div><div class="sync"><span id="syncMsg">${syncHTML()}</span><button data-act="refresh" title="Actualizar ahora">${ic('refresh', 14)}<span>Actualizar</span></button></div></div>`;
+  return `<div class="tabs">${home}${tks}<div class="grow"></div><div class="sync"><span class="me" title="${esc(SH.err ? 'Sin sincronizar con el equipo: ' + SH.err : SH.last ? 'Sincronizado con el equipo ' + ago(SH.last) : 'Sesión')}">${esc(prettyUser(meName()))} · ${ROLE_LABEL[role()]}${S.settings.syncKV && C.health && C.health.kv !== false ? `<i class="sdot ${SH.err ? 'bad' : ''}"></i>` : ''}</span><span id="syncMsg">${syncHTML()}</span><button data-act="refresh" title="Actualizar ahora">${ic('refresh', 14)}<span>Actualizar</span></button></div></div>`;
 }
 function bellHTML() {
   const items = S.notifications.slice(0, 40).map(a => `<div class="al ${a.read ? '' : 'un'}" data-act="alertGo" data-id="${a.tid}" data-aid="${a.id}"><div>${ic(a.kind === 'vence' ? 'clock' : a.kind === 'avance' ? 'refresh' : a.kind === 'cal' ? 'cal' : 'bell', 16)}</div><div><div>${esc(a.text)}</div><div class="muted sm">${ago(a.ts)}</div></div></div>`).join('');
@@ -952,6 +935,10 @@ function bellHTML() {
 }
 function viewHTML() {
   if (!configured() && UI.route.v !== 'settings') return `<div class="page"><h1>Bienvenido</h1><p class="lead">Conecta primero el Worker (Zendesk, Slack e IA). Toma 10 minutos y es gratis.</p><button class="btn pri" data-act="nav" data-v="settings">Ir a Ajustes</button></div>`;
+  const ro = canEdit() ? '' : `<div class="ro-banner">Modo solo lectura: puedes ver, filtrar y copiar, pero no editar ni usar la IA.</div>`;
+  return ro + viewBody();
+}
+function viewBody() {
   switch (UI.route.v) {
     case 'ticket': return S.tickets[UI.route.id] ? ticketView(S.tickets[UI.route.id]) : '<div class="empty">Ticket no encontrado</div>';
     case 'status': return statusView();
@@ -1052,12 +1039,12 @@ function slackTab(t) {
 /* --- seguimiento --- */
 function segTab(t) {
   const steps = (t.steps || []).slice().sort((a, b) => (a.done - b.done) || (a.due ? (b.due ? a.due.localeCompare(b.due) : -1) : (b.due ? 1 : 0)));
-  const rows = steps.map(s => `<tr class="${s.done ? 'done' : ''}"><td><input type="checkbox" data-ch="stepDone" data-id="${t.id}" data-sid="${s.id}" ${s.done ? 'checked' : ''}></td><td>${s.type === 'pendiente' ? 'Pendiente' : 'Siguiente paso'}</td><td>${esc(s.text)}</td><td>${ownP(s.owner)}</td><td><select class="mini" data-ch="stepField" data-k="area" data-id="${t.id}" data-sid="${s.id}">${areaOpts(s.area)}</select></td><td><input type="text" class="mini" list="dl_who" data-ch="stepField" data-k="who" data-id="${t.id}" data-sid="${s.id}" value="${esc(s.who || '')}" placeholder="Encargado"></td><td><input type="date" class="mini" data-ch="stepField" data-k="start" data-id="${t.id}" data-sid="${s.id}" value="${esc((s.start || '').slice(0, 10))}"></td><td class="num" ${!s.done && s.due && parseDue(s.due) < new Date() ? 'style="color:var(--red);font-weight:600"' : ''}>${fmtDue(s.due)}</td><td><button class="ibtn" data-act="delStep" data-id="${t.id}" data-sid="${s.id}">${ic('trash', 14)}</button></td></tr>`).join('');
+  const rows = steps.map(s => `<tr class="${s.done ? 'done' : ''}"><td><input type="checkbox" data-ch="stepDone" data-id="${t.id}" data-sid="${s.id}" ${s.done ? 'checked' : ''}></td><td style="white-space:nowrap">${s.type === 'pendiente' ? 'Pendiente' : 'Siguiente'}</td><td style="min-width:190px">${esc(s.text)}${s.by ? `<div class="muted sm">${s.by === 'IA' ? '✦ detectado por IA' : 'por ' + esc(prettyUser(s.by))}${s.doneBy === 'IA' ? ' · cerrado por IA' : ''}</div>` : ''}</td><td>${ownP(s.owner)}</td><td><select class="mini" data-ch="stepField" data-k="area" data-id="${t.id}" data-sid="${s.id}">${areaOpts(s.area)}</select></td><td><input type="text" class="mini" list="dl_who" data-ch="stepField" data-k="who" data-id="${t.id}" data-sid="${s.id}" value="${esc(s.who || '')}" placeholder="Encargado"></td><td class="num" ${!s.done && s.due && parseDue(s.due) < new Date() ? 'style="color:var(--red);font-weight:600"' : ''}>${fmtDue(s.due)}</td><td><button class="ibtn" data-act="delStep" data-id="${t.id}" data-sid="${s.id}">${ic('trash', 14)}</button></td></tr>`).join('');
   const rem = (t.reminders || []).slice().sort((a, b) => (a.done - b.done) || String(a.due).localeCompare(String(b.due)));
   const rrows = rem.map(r => `<tr class="${r.done ? 'done' : ''}"><td><input type="checkbox" data-ch="remDone" data-id="${t.id}" data-rid="${r.id}" ${r.done ? 'checked' : ''}></td><td>${esc(r.text)}</td><td class="num" ${!r.done && parseDue(r.due) < new Date() ? 'style="color:var(--red);font-weight:600"' : ''}>${fmtDue(r.due)}</td><td class="muted sm">${esc(r.source || '')}</td><td><button class="ibtn" data-act="delRem" data-id="${t.id}" data-rid="${r.id}">${ic('trash', 14)}</button></td></tr>`).join('');
   const det = detectedFor(t);
-  return `<div class="sec"><h3>Siguientes pasos y pendientes</h3>
-    ${steps.length ? `<table class="tb"><thead><tr><th></th><th>Tipo</th><th>Descripción</th><th>Responsable</th><th>Área</th><th>Encargado</th><th>Inicio</th><th>Vence</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="muted">Nada registrado. Usa la IA (panel derecho) o agrega manualmente.</div>'}
+  return autoBox(t) + `<div class="sec"><h3>Siguientes pasos y pendientes</h3>
+    ${steps.length ? `<table class="tb"><thead><tr><th></th><th>Tipo</th><th>Descripción</th><th>Resp.</th><th>Área</th><th>Encargado</th><th>Vence</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="muted">Nada registrado. Usa la IA (panel derecho) o agrega manualmente.</div>'}
     <div class="addrow"><select id="ns_type"><option value="siguiente">Siguiente paso</option><option value="pendiente">Pendiente</option></select><input type="text" id="ns_text" placeholder="Descripción"><select id="ns_owner"><option value="cliente">Cliente</option><option value="inference">Inference</option></select><input type="date" id="ns_date"><input type="time" id="ns_time"><button class="btn pri" data-act="addStep" data-id="${t.id}">${ic('plus', 14)} Agregar</button></div>
     <div class="addrowA"><select id="ns_area">${areaOpts('')}</select><input type="text" id="ns_who" list="dl_who" placeholder="Encargado (quién lo hace)"><label>Inicio (opcional)<input type="date" id="ns_start"></label></div>${whoDatalist()}
     <div class="muted sm" style="margin-top:6px">Los pasos con fecha de vencimiento salen en el Gantt y en el Calendario con su área y encargado.</div></div>
@@ -1113,12 +1100,13 @@ function aiPanel(t) {
     <button class="btn pri" style="width:100%;justify-content:center" data-act="analyze" data-id="${t.id}" ${b ? 'disabled' : ''}>${b ? '<span class="spin" style="display:inline-block">' + ic('refresh', 14) + '</span> Analizando…' : ic('spark', 14) + ' Analizar ticket (Zendesk + Slack)'}</button>
     <details style="margin:10px 0"><summary>Agregar contexto o instrucción</summary><textarea data-ch="extra" data-id="${t.id}" placeholder="Pega correos, notas de llamada, algo que no esté en Zendesk/Slack…" style="margin-top:8px">${esc(UI.extra[t.id] || '')}</textarea><input type="text" id="aiInstr" placeholder="Instrucción para las respuestas (ej: tono más firme)" style="margin-top:6px"><button class="btn sm" style="margin-top:6px" data-act="analyze" data-id="${t.id}" data-instr="1">Regenerar con instrucción</button></details>
     ${a ? `<div class="aibox"><h4>En qué estamos</h4><p>${esc(a.resumen || '—')}</p>${a.ultimo_avance ? `<h4 style="margin-top:8px">Último avance</h4><p>${esc(a.ultimo_avance)}</p>` : ''}${a.estado ? `<div class="row" style="margin-top:8px"><span class="muted sm">Estado sugerido:</span><span class="pill p-inference">${esc(a.estado)}</span>${STATUSES.includes(a.estado) && statusOf(t) !== a.estado ? `<button class="btn sm" data-act="aiState" data-id="${t.id}">Aplicar</button>` : ''}</div>` : ''}</div>
+      ${allGaps(t).length ? `<div class="aibox" style="border-color:#f3d28a;background:var(--amber-bg)"><h4 style="color:var(--amber)">Falta</h4><ul class="clean">${allGaps(t).map(x => `<li>${esc(x)}</li>`).join('')}</ul></div>` : ''}
       ${(a.alertas || []).length ? `<div class="aibox" style="border-color:#f1b9bf;background:var(--red-bg)"><h4 style="color:var(--red)">Atención</h4><ul class="clean">${a.alertas.map(x => `<li>${esc(x)}</li>`).join('')}</ul></div>` : ''}
       <div class="aibox"><div class="row sp"><h4>Siguientes pasos</h4>${((a.siguientes_pasos || []).length + (a.pendientes || []).length) ? `<button class="btn sm" data-act="aiAddAll" data-id="${t.id}">Agregar todo</button>` : ''}</div>${items(a.siguientes_pasos, 'siguiente') || '<div class="muted">—</div>'}</div>
       <div class="aibox"><h4>Pendientes</h4>${items(a.pendientes, 'pendiente') || '<div class="muted">—</div>'}</div>
       ${(a.fechas || []).length ? `<div class="aibox"><h4>Fechas detectadas por IA</h4>${a.fechas.map((f, i) => `<div class="aiitem"><div class="tx"><b>${fmtDue(f.fecha)}</b> ${esc(f.hora && f.hora !== 'null' ? f.hora : '')} — ${esc(f.texto)}</div><button class="btn sm" data-act="aiRemind" data-id="${t.id}" data-i="${i}" title="Crear recordatorio">${ic('bell', 13)}</button></div>`).join('')}</div>` : ''}
       ${(a.respuestas || []).length ? `<div class="aibox"><h4>Respuestas sugeridas</h4>${a.respuestas.map((r, i) => `<div class="reply"><b>${esc(r.titulo)}</b><pre id="rp_${t.id}_${i}">${esc(r.texto)}</pre><div class="row"><button class="btn sm" data-act="copyEl" data-el="rp_${t.id}_${i}">${ic('copy', 13)} Copiar</button><button class="btn sm" data-act="aiToTpl" data-id="${t.id}" data-i="${i}">Llevar a Plantillas</button></div></div>`).join('')}</div>` : ''}` :
-    '<div class="empty" style="padding:24px 4px">Pulsa «Analizar» para obtener el resumen, siguientes pasos, pendientes con responsable, fechas y respuestas sugeridas.</div>'}`;
+    `<div class="empty" style="padding:24px 4px">${b ? 'Analizando Zendesk y Slack…' : S.settings.autoAI && canEdit() ? 'El análisis automático de este ticket está en cola y se hará solo. Si quieres verlo ya, pulsa «Analizar».' : 'Pulsa «Analizar» para obtener el resumen, siguientes pasos, pendientes con responsable, fechas y respuestas sugeridas.'}</div>`}`;
 }
 
 /* ---------- pendientes globales ---------- */
@@ -1184,15 +1172,15 @@ function settingsView() {
     <div class="card" style="margin-bottom:16px"><h3>Qué tickets entran</h3>${inp('keywords', 'Palabras clave del Formulario de Zendesk', 'text', 'Entran los tickets cuyo «Formulario» contenga alguna (separadas por coma): evolutivo, deuda técnica, proyecto.')}
       ${inp('internalDomains', 'Dominios del equipo Inference', 'text', 'Sirve para distinguir quién escribió: cliente o Inference.')}${chk('includeSolved', 'Incluir tickets resueltos al sincronizar')}${chk('autoDates', 'Crear recordatorios solos cuando aparezca una fecha en Zendesk, Slack o en el análisis de IA')}
       ${inp('dateOwner', 'Quién envía las fechas de entrega', 'text', 'Se usa en el Calendario y en los avisos cuando falta una fecha.')}
+      ${chk('autoAI', 'Seguimiento automático con IA: analiza los tickets con novedades, agrega los siguientes pasos y avisa lo que falta')}<div style="width:220px">${inp('aiPerHour', 'Máx. análisis automáticos por hora', 'number', 'Cuida el límite gratuito de la IA.')}</div>
       ${inp('areas', 'Áreas del equipo (separadas por coma)', 'text', 'Aparecen al asignar área a hitos, entregables y tareas.')}${inp('provider', 'Nombre del proveedor (para el Status)', 'text', 'Sale en el encabezado del reporte de Status.')}
       <div class="muted sm" style="margin-top:10px">Formularios detectados: ${C.forms.length ? C.forms.map(f => `<span class="ztag">${esc(f.name)}</span>`).join(' ') : '—'}</div></div>
     <div class="card" style="margin-bottom:16px"><h3>Frecuencia y alertas</h3><div class="row wrap" style="gap:18px;align-items:flex-start"><div style="width:180px">${inp('pollSec', 'Zendesk cada (seg)', 'number')}</div><div style="width:180px">${inp('slackPollSec', 'Slack cada (seg)', 'number')}</div><div style="width:180px">${inp('leadMin', 'Avisar antes (min)', 'number')}</div><div style="width:180px">${inp('staleDays', 'Seguimiento tras (días)', 'number', 'Sin respuesta del cliente')}</div><div style="width:180px">${inp('replyHours', 'Responder en (horas)', 'number', 'Cliente esperando')}</div><div style="width:180px">${inp('dailyTime', 'Update del día a las', 'time')}</div></div>
       <div class="row" style="margin-top:12px"><button class="btn" data-act="askNotif">Activar avisos del navegador</button><span class="muted sm">Estado: ${'Notification' in window ? Notification.permission : 'no disponible'}. Los avisos funcionan mientras la pestaña esté abierta (fíjala).</span></div>${inp('myName', 'Tu nombre (firma de plantillas)')}</div>
-    <div class="card" style="margin-bottom:16px"><h3>Crear usuario de acceso</h3><div class="muted sm" style="margin-bottom:8px">Genera un usuario y una contraseña aleatoria. Pégalos en el Worker (secreto <code>APP_USERS</code>) para dar acceso a otra persona. No se guarda nada en esta web.</div>
-      <div class="row wrap"><input type="text" id="nu_user" placeholder="usuario (ej: maria)" value="${esc(UI.nu.user)}" style="width:200px"><button class="btn pri" data-act="genUser">${ic('spark', 14)} Generar</button></div>
-      ${UI.nu.pass ? `<div class="aibox" style="margin-top:10px"><h4>Credenciales</h4><div>Usuario: <b>${esc(UI.nu.user)}</b></div><div>Contraseña: <code id="nu_pass">${esc(UI.nu.pass)}</code></div><div class="muted sm" style="margin:8px 0 4px">Línea para <code>APP_USERS</code> (JSON; agrega más usuarios separados por coma):</div><pre class="pre" id="nu_json">${esc(JSON.stringify({ [UI.nu.user]: UI.nu.pass }))}</pre><div class="row" style="margin-top:8px"><button class="btn sm" data-act="copyEl" data-el="nu_pass">${ic('copy', 13)} Copiar contraseña</button><button class="btn sm" data-act="copyEl" data-el="nu_json">${ic('copy', 13)} Copiar JSON</button></div></div>` : ''}</div>
+    ${usersCard()}
     <div class="card" style="margin-bottom:16px"><h3>Datos</h3><div class="row wrap"><button class="btn" data-act="exportData">${ic('down', 14)} Exportar copia</button><label class="btn">${ic('up', 14)} Importar copia<input type="file" accept=".json" style="display:none" data-ch="importData"></label>
-      ${chk('syncKV', 'Sincronizar con la nube gratuita (KV)')}<button class="btn" data-act="kvPush">Subir ahora</button><button class="btn" data-act="kvPull">Descargar</button></div></div>
+      ${chk('syncKV', 'Compartir datos con el equipo (KV)')}<button class="btn" data-act="syncNow">${ic('refresh', 14)} Sincronizar ahora</button></div>
+      <div class="muted sm" style="margin-top:8px">${SH.err ? `<span style="color:var(--red)">${esc(SH.err)}</span>` : SH.last ? `Sincronizado ${ago(SH.last)} (versión ${SH.rev}). Lo que tú o tu equipo cambien en pasos, plan, reuniones, notas, status y dashboards se comparte solo.` : 'Aún no se ha sincronizado.'}</div></div>
     <div class="card"><h3>Canales de Slack detectados sin ticket (${unl.length})</h3>${UI.slackErr ? `<div class="login-err" style="margin:8px 0">Slack: ${esc(UI.slackErr)}</div>` : ''}<div class="muted sm" style="margin:6px 0 10px">Nombres válidos: pry-… / evo-… / dt-…  Si no tienen número de ticket, vincúlalos a mano desde el ticket.</div><div class="ztags">${unl.slice(0, 80).map(c => `<span class="ztag">#${esc(c.name)}${c.archived ? ' ✓' : ''}</span>`).join('') || '<span class="muted">—</span>'}</div></div></div>`;
 }
 
@@ -1237,8 +1225,8 @@ function statusView() {
     return `<tr><td class="num"><a href="#" data-act="openTicket" data-id="${t.id}"><b>${esc(t.id)}</b></a><div class="muted sm">${t.type.toUpperCase()}</div></td>
       <td>${esc(tplVars(t).asunto)}</td>
       <td>${edit ? txt('area', d.area) : esc(area || '—')}</td>
-      <td style="white-space:nowrap">${edit ? `<span class="st-dot" style="background:${repColor(est)}"></span><select data-ch="repField" data-id="${t.id}" data-k="estado"><option value="">Auto · ${esc(repEstado({ ...t, rep: { ...r, estado: '' } }))}</option>${REP_STATES.map(([n]) => `<option ${r.estado === n ? 'selected' : ''}>${n}</option>`).join('')}</select>` : `<span class="st-dot" style="background:${repColor(est)}"></span>${esc(est)}`}</td>
-      <td>${edit ? txt('resp', d.resp) : esc(r.resp || d.resp || '—')}</td>
+      <td style="white-space:nowrap">${edit ? `<span class="st-dot" style="background:${repColor(est)}"></span><select data-ch="repField" data-id="${t.id}" data-k="estado"><option value="">Auto · ${esc(repEstado({ ...t, rep: { ...r, estado: '' } }))}</option>${REP_STATES.map(([n]) => `<option ${r.estado === n ? 'selected' : ''}>${n}</option>`).join('')}</select>` : `<span class="st-dot" style="background:${repColor(est)}"></span>${esc(est)}`}${allGaps(t).length ? `<div class="noprint"><span class="gap" title="${esc(allGaps(t).join(' · '))}">⚠ ${allGaps(t).length} por completar</span></div>` : ''}</td>
+      <td>${edit ? `<input type="text" data-ch="repField" data-id="${t.id}" data-k="resp" value="${esc(r.resp)}" placeholder="${esc(d.resp)}">` : respHTML(t)}</td>
       <td class="num">${edit ? `<input type="number" step="0.5" min="0" data-ch="repField" data-id="${t.id}" data-k="hEst" value="${esc(r.hEst)}" placeholder="${zh === null ? 'Por definir' : zh}">` : (e === '' ? 'Por definir' : fmtH(e))}</td>
       <td class="num">${edit ? `<input type="number" step="0.5" min="0" data-ch="repHours" data-id="${t.id}" value="${esc(r.hours[m] ?? '')}" placeholder="0">` : fmtH(r.hours[m] || 0)}</td>
       <td>${edit ? `<textarea rows="3" data-ch="repField" data-id="${t.id}" data-k="sit" placeholder="${esc(d.sit)}">${esc(r.sit)}</textarea>` : esc(r.sit || d.sit || '—')}</td>
@@ -1257,6 +1245,7 @@ function statusView() {
       <button class="btn" data-act="stFill" title="Completa los campos vacíos con lo que ya hay en Seguimiento y la IA">${ic('spark', 14)} Autocompletar</button>
       <button class="btn" data-act="stCopy">${ic('copy', 14)} Copiar tabla</button>
       <button class="btn pri" data-act="stPrint">${ic('file', 14)} Imprimir / PDF</button></div>
+    ${aiStrip(list)}
     <div class="st-head"><div><h1>${esc(title)} – Status de requerimientos</h1>
       ${one ? `<div class="st-sub">Plataforma: ${edit ? `<input type="text" class="st-plat" data-ch="cfgField" data-c="${esc(cl)}" data-k="plataforma" value="${esc(plat)}" placeholder="Ej: Zendesk integrada con Five9 (Llamadas)">` : esc(plat || '—')}</div>` : ''}</div>
       <div class="st-brand"><b>${esc(S.settings.provider || 'Inference Labs9')}</b></div></div>
@@ -1267,8 +1256,9 @@ function statusView() {
         <div class="st-h used"><div class="muted sm">Horas utilizadas este mes</div><b>${fmtH(used).replace(' h', '')}</b><div class="muted sm">Total horas utilizadas</div></div>
         <div class="st-h bal ${saldo >= 0 ? 'pos' : ''}"><div class="muted sm">Horas disponibles (saldo)</div><b style="color:${saldo >= 0 ? 'var(--green)' : 'var(--red)'}">${fmtH(saldo).replace(' h', '')}</b><div class="muted sm">Saldo restante</div></div></div>
         <div class="muted sm" style="margin-top:8px">${ic('clock', 13)} La bolsa mensual se renueva cada mes. Las horas utilizadas se guardan por mes.</div></div></div>
+    ${(() => { const gl = list.filter(t => allGaps(t).length); return gl.length ? `<details class="noprint gapdet" style="margin-bottom:12px"><summary><b>Por completar (${gl.length} ticket${gl.length > 1 ? 's' : ''})</b> — datos que faltan para que el reporte esté completo</summary><table class="tb"><tbody>${gl.map(t => `<tr class="click" data-act="openTicket" data-id="${t.id}"><td class="num"><b>#${t.id}</b></td><td>${gapChips(t, 6)}</td></tr>`).join('')}</tbody></table></details>` : ''; })()}
     <div class="st-bar">Seguimiento de requerimientos</div>
-    ${rows.length ? `<table class="st-table"><thead><tr><th>N°</th><th>Requerimiento</th><th>Área / Impacto</th><th>Estado</th><th>Responsable / Dependencia</th><th>Horas estimadas</th><th>Horas utilizadas este mes</th><th>Situación actual</th><th>Próxima acción</th><th class="noprint"></th></tr></thead><tbody>${trs}</tbody></table>` : '<div class="empty">No hay requerimientos para este cliente con estos filtros.</div>'}
+    ${rows.length ? `<table class="st-table"><thead><tr><th>N°</th><th>Requerimiento</th><th>Área / Impacto</th><th>Estado</th><th>Responsable de actividades / Dependencia</th><th>Horas estimadas</th><th>Horas utilizadas este mes</th><th>Situación actual</th><th>Próxima acción</th><th class="noprint"></th></tr></thead><tbody>${trs}</tbody></table>` : '<div class="empty">No hay requerimientos para este cliente con estos filtros.</div>'}
     <div class="st-foot"><div class="st-legend">${REP_STATES.map(([n, c]) => `<span><i class="st-dot" style="background:${c}"></i>${n}</span>`).join('')}</div><div class="st-total">Total horas estimadas de los requerimientos: <b>${fmtH(estTotal)}</b></div></div></div>`;
 }
 
@@ -1373,7 +1363,7 @@ function calView() {
 }
 
 /* ================= DASHBOARDS: vistas editables ================= */
-const KPIS = [['total', 'Tickets'], ['espCliente', 'Esperando cliente'], ['atencion', 'Requieren atención'], ['entr7', 'Entregas en ≤ 7 días'], ['entrLate', 'Entregas atrasadas'], ['sinFecha', 'Sin fecha de entrega'], ['hitos14', 'Hitos y entregables en ≤ 14 días'], ['tareasLate', 'Tareas vencidas']];
+const KPIS = [['total', 'Tickets'], ['espCliente', 'Esperando cliente'], ['atencion', 'Requieren atención'], ['entr7', 'Entregas en ≤ 7 días'], ['entrLate', 'Entregas atrasadas'], ['sinFecha', 'Sin fecha de entrega'], ['hitos14', 'Hitos y entregables en ≤ 14 días'], ['tareasLate', 'Tareas vencidas'], ['faltan', 'Con datos por completar']];
 const DEF_KPIS = ['total', 'atencion', 'entr7', 'entrLate', 'sinFecha', 'tareasLate'];
 const DEF_VIEW = () => ({ level: 'proyecto', cols: {}, kpis: DEF_KPIS.slice(), hidePast: true });
 function viewOf(d) {
@@ -1409,11 +1399,14 @@ const PCOLS = [
   ['hitos', 'Hitos', t => itemProg(t, 'hito'), 'num'],
   ['entregables', 'Entregables', t => itemProg(t, 'entregable'), 'num'],
   ['tareas', 'Tareas abiertas', taskProg, 'num'],
+  ['situacion', 'Situación (IA)', t => { const a = t.ai && t.ai.data; return a && a.resumen ? `<span title="${esc(a.resumen)}">${esc(trunc(a.resumen, 130))}</span>${aiFresh(t) ? '' : ' <span class="muted sm" title="Hay novedades sin analizar">·</span>'}` : `<span class="muted">${UI.busy['ai' + t.id] ? 'analizando…' : 'por analizar'}</span>`; }, '', 'max-width:320px'],
+  ['encargados', 'Encargados', t => respHTML(t), '', 'max-width:200px'],
+  ['faltan', 'Faltan', t => gapChips(t), '', 'max-width:260px'],
   ['slack', 'Slack', t => t.slackId ? `<span class="muted" title="${esc(t.slackName)}">${ic('hash', 14)}</span>` : '<span class="muted" title="Sin canal vinculado">—</span>'],
   ['flags', 'Alertas', flagsHTML],
   ['act', 'Actividad', t => `<span class="muted sm">${ago(lastActivity(t))}</span>`],
 ];
-const PCOLS_DEF = ['tipo', 'num', 'asunto', 'cliente', 'zd', 'estado', 'siguiente', 'resp', 'vence', 'entrega', 'slack', 'flags', 'act'];
+const PCOLS_DEF = ['tipo', 'num', 'asunto', 'cliente', 'estado', 'situacion', 'siguiente', 'encargados', 'vence', 'entrega', 'faltan', 'flags'];
 const diasTxt = i => { const n = daysTo(i.end); return n < 0 ? `hace ${-n} d` : n === 0 ? 'hoy' : `en ${n} d`; };
 const ICOLS = [
   ['tipo', 'Tipo', i => tagT(i.t.type)],
@@ -1439,6 +1432,7 @@ function kpiVal(k, l, its) {
     case 'entrLate': { const n = l.filter(t => { const d = deliveryOf(t); return d && daysTo(d.date) < 0; }).length; return [n, n]; }
     case 'sinFecha': return [l.filter(t => !deliveryOf(t)).length, 0];
     case 'hitos14': return [its.filter(i => (i.kind === 'hito' || i.kind === 'entregable') && daysTo(i.end) >= 0 && daysTo(i.start) <= 14).length, 0];
+    case 'faltan': { const n = l.filter(t => allGaps(t).length).length; return [n, 0]; }
     case 'tareasLate': { const n = its.filter(i => i.kind === 'tarea' && itemState(i) === 'Vencido').length; return [n, n]; }
   }
   return [0, 0];
@@ -1482,7 +1476,7 @@ function dashView() {
   }
   const kp = v.kpis.map(k => { const [n, bad] = kpiVal(k, list, its), lb = (KPIS.find(x => x[0] === k) || [0, k])[1]; return `<div class="kpi ${bad ? 'bad' : ''}"><b>${n}</b><span>${esc(lb)}</span></div>`; }).join('');
   return `<div class="split">${tree}<section class="content"><div class="dhead"><h2>${d ? esc(d.name) : 'Todos los tickets'} <span class="muted" style="font-weight:400;font-size:13px">· ${count}</span></h2>${levelBar}${bar}</div>
-    ${kp ? `<div class="kpis">${kp}</div>` : ''}${table}</section></div>`;
+    ${aiStrip(list)}${kp ? `<div class="kpis">${kp}</div>` : ''}${table}</section></div>`;
 }
 function viewEditor() {
   const d = curDash(), v = viewOf(d), defs = v.level === 'proyecto' ? PCOLS : ICOLS, cur = colsOf(v);
@@ -1494,6 +1488,336 @@ function viewEditor() {
     <label class="lb">Indicadores sobre la tabla</label><div class="vgrid">${KPIS.map(k => `<label class="row"><input type="checkbox" data-ch="viewKpi" data-k="${k[0]}" ${v.kpis.includes(k[0]) ? 'checked' : ''}> ${k[1]}</label>`).join('')}</div>
     ${v.level !== 'proyecto' ? `<label class="row" style="margin-top:14px"><input type="checkbox" data-ch="viewHide" ${v.hidePast ? 'checked' : ''}> Ocultar los que ya pasaron o están hechos</label>` : ''}
     <div class="muted sm" style="margin-top:12px">Los cambios se aplican al momento y se guardan en este dashboard.</div>`);
+}
+
+/* =====================================================================
+   v1.6 — roles, datos compartidos entre usuarios y seguimiento automático con IA
+   ===================================================================== */
+const hid = s => { let h = 5381; s = String(s); for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return (h >>> 0).toString(36); };
+
+/* ---------- roles ---------- */
+const ROLE_LABEL = { admin: 'Administrador', editor: 'Editor', lector: 'Solo lectura' };
+const role = () => (session() || {}).role || 'editor';
+const canEdit = () => role() !== 'lector';
+const isAdmin = () => role() === 'admin';
+const meName = () => (session() || {}).user || '';
+const inits = n => String(n || '?').split(/[\s._-]+/).filter(Boolean).slice(0, 2).map(x => x[0].toUpperCase()).join('') || '?';
+const prettyUser = u => String(u || '').replace(/[._-]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+/* acciones permitidas al rol «lector» (solo mirar, filtrar y copiar) */
+const VIEW_ACT = new Set(['doLogin', 'logout', 'nav', 'bell', 'alertGo', 'alertsRead', 'openTicket', 'closeTab', 'calNav', 'calType', 'calDay', 'calWho', 'calClear', 'selectDash', 'toggleFolder', 'dfType', 'ttab', 'closeModal', 'refresh', 'refreshOne', 'copyEl', 'dailyCopy', 'dailyCopyHTML', 'archCopy', 'archDl', 'stType', 'stCopy', 'stPrint', 'gz', 'viewLevel', 'viewEdit', 'pendF', 'tplSel', 'tplRegen', 'tplMail', 'testConn', 'askNotif', 'exportData', 'syncNow', 'briefClose', 'copyCred']);
+const VIEW_CH = new Set(['dfilter', 'calSel', 'calOpt', 'stSel', 'stChk', 'pendOver', 'dailyScope', 'viewLevel', 'viewCol', 'viewKpi', 'viewHide', 'tplPick', 'tplText', 'extra', 'set', 'setChk']);
+function roGuard(kind, name) {
+  if (canEdit() || (kind === 'act' ? VIEW_ACT : VIEW_CH).has(name)) return true;
+  toast('Tu rol es de solo lectura: puedes ver y filtrar, pero no editar.', 'err'); render();
+  return false;
+}
+
+/* ---------- equipo, presencia y usuarios ---------- */
+UI.um = { users: [], kv: true, loaded: false, cred: null, err: '' };
+async function loadMe() {
+  try {
+    const j = await api('/me'); C.me = j;
+    const s = session(); if (s && (s.role !== j.role || s.user !== j.user)) { s.role = j.role; s.user = j.user; localStorage.setItem(SESS, JSON.stringify(s)); }
+    softRender();
+  } catch (e) { /* Worker antiguo sin /me */ }
+}
+async function loadUsers() {
+  try { const j = await api('/users'); UI.um.users = j.users || []; UI.um.kv = j.kv !== false; UI.um.loaded = true; UI.um.err = ''; }
+  catch (e) { UI.um.err = e.message; }
+  if (UI.route.v === 'settings') softRender();
+}
+const seenTxt = ts => !ts ? 'nunca' : (Date.now() - ts < 6 * 60000 ? '<span class="online"></span>conectado' : ago(ts));
+function usersCard() {
+  const mine = role(), list = (isAdmin() && UI.um.loaded ? UI.um.users : (C.me && C.me.users) || []);
+  const kvOk = !(C.health && C.health.kv === false);
+  const rows = list.map(u => {
+    const edit = isAdmin() && u.src === 'app';
+    return `<tr><td><b>${esc(prettyUser(u.user))}</b> <span class="muted sm">${esc(u.user)}</span>${u.user === meName() ? ' <span class="pill p-green">tú</span>' : ''}</td>
+      <td>${edit ? `<select class="mini" data-ch="userRole" data-u="${esc(u.user)}">${['admin', 'editor', 'lector'].map(r => `<option value="${r}" ${u.role === r ? 'selected' : ''}>${ROLE_LABEL[r]}</option>`).join('')}</select>` : `<span class="pill ${u.role === 'admin' ? 'p-inference' : u.role === 'lector' ? 'p-grey' : 'p-green'}">${ROLE_LABEL[u.role] || u.role}</span>`}</td>
+      <td class="muted sm">${u.src === 'env' ? 'Cloudflare' : 'Creado en la web'}</td><td class="sm">${seenTxt(u.seen)}</td>
+      <td style="white-space:nowrap">${edit ? `<button class="btn sm" data-act="userReset" data-u="${esc(u.user)}">Nueva clave</button> <button class="btn sm danger" data-act="userDel" data-u="${esc(u.user)}">${ic('trash', 13)}</button>` : ''}</td></tr>`;
+  }).join('');
+  const cred = UI.um.cred ? `<div class="aibox" style="margin-top:12px"><h4>Credenciales (cópialas ahora: la clave no se vuelve a mostrar)</h4><div>Usuario: <b id="cr_user">${esc(UI.um.cred.user)}</b> · Rol: ${ROLE_LABEL[UI.um.cred.role]}</div><div>Contraseña: <code id="cr_pass">${esc(UI.um.cred.pass)}</code></div><div class="row" style="margin-top:8px"><button class="btn sm" data-act="copyEl" data-el="cr_pass">${ic('copy', 13)} Copiar contraseña</button><button class="btn sm" data-act="copyCred">${ic('copy', 13)} Copiar mensaje para enviarle</button></div></div>` : '';
+  const log = (S.log || []).slice().sort((a, b) => b.at - a.at).slice(0, 20).map(l => `<tr class="${S.tickets[l.tid] ? 'click' : ''}" ${S.tickets[l.tid] ? `data-act="openTicket" data-id="${esc(l.tid)}"` : ''}><td class="muted sm" style="white-space:nowrap">${ago(l.at)}</td><td><b>${esc(l.by === 'IA' ? 'IA' : prettyUser(l.by))}</b></td><td>#${esc(l.tid)} · ${esc(l.txt)}</td></tr>`).join('');
+  return `<div class="card" style="margin-bottom:16px"><h3>Equipo y accesos</h3>
+    <div class="muted sm" style="margin:4px 0 10px">Tu rol: <b>${ROLE_LABEL[mine]}</b>. <b>Administrador</b>: todo y crea usuarios · <b>Editor</b>: ve y edita todo, usa la IA · <b>Solo lectura</b>: solo ve.</div>
+    ${list.length ? `<table class="tb"><thead><tr><th>Usuario</th><th>Rol</th><th>Origen</th><th>Último acceso</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="muted">Cargando equipo…</div>'}
+    ${UI.um.err && isAdmin() ? `<div class="login-err">${esc(UI.um.err)}</div>` : ''}
+    ${isAdmin() ? (kvOk ? `<div class="row wrap" style="margin-top:12px"><input type="text" id="um_user" placeholder="usuario (ej: maria)" style="width:190px"><select id="um_role" style="width:160px"><option value="editor">Editor</option><option value="lector">Solo lectura</option><option value="admin">Administrador</option></select><button class="btn pri" data-act="userCreate">${ic('plus', 14)} Crear y generar contraseña</button></div>` : '<div class="muted sm" style="margin-top:10px">Para crear usuarios desde aquí activa el KV (binding <code>STATE</code>) en el Worker. Mientras tanto usa <code>APP_USER_2</code> o <code>APP_USERS</code> en Cloudflare.</div>') : ''}
+    ${cred}
+    <h3 style="margin-top:18px">Actividad reciente del equipo</h3>${log ? `<table class="tb"><tbody>${log}</tbody></table>` : '<div class="muted">Aún no hay cambios registrados. Aparecen cuando alguien edita un ticket y se sincroniza.</div>'}</div>`;
+}
+
+/* ---------- datos compartidos entre usuarios (3-way merge sobre KV) ---------- */
+const SH_T = ['steps', 'reminders', 'plan', 'meetings', 'notes', 'internal', 'deliveryManual', 'dateAsked', 'rep', 'ai', 'slackId', 'slackName', 'slackAuto', 'slackMatch', 'slackManualOff', 'converted'];
+const SH_TOP = ['folders', 'archive', 'templates', 'clientCfg', 'viewAll'];
+const BASE_K = 'pm_base_v1';
+const SH = { rev: 0, base: null, busy: false, quiet: false, err: '', at: 0, by: '', timer: null };
+const emptyish = v => v == null || v === '' || v === false || (Array.isArray(v) ? !v.length : (typeof v === 'object' && Object.values(v).every(emptyish)));
+const stable = v => JSON.stringify(v, (k, x) => (x && typeof x === 'object' && !Array.isArray(x)) ? Object.keys(x).sort().reduce((o, key) => (o[key] = x[key], o), {}) : x);
+const same = (a, b) => (emptyish(a) && emptyish(b)) || stable(a) === stable(b);
+function merge3(b, l, r, key) {
+  if (same(l, r)) return l;
+  if (same(l, b)) return r;
+  if (same(r, b)) return l;
+  if (key === 'ai' && l && r && typeof l === 'object' && typeof r === 'object') return (l.ts || 0) >= (r.ts || 0) ? l : r;
+  if (Array.isArray(l) && Array.isArray(r)) {
+    if ([...l, ...r].every(x => x && typeof x === 'object' && x.id !== undefined)) {
+      const mk = a => new Map((Array.isArray(a) ? a : []).map(x => [x.id, x]));
+      const B = mk(b), L = mk(l), R = mk(r), ids = [...new Set([...r.map(x => x.id), ...l.map(x => x.id)])], out = [];
+      for (const id of ids) {
+        const li = L.get(id), ri = R.get(id), bi = B.get(id);
+        let v;
+        if (li && ri) v = merge3(bi, li, ri, 'item');
+        else if (li) v = bi && same(li, bi) ? undefined : li;   // el otro lo borró (y yo no lo toqué) → se borra
+        else v = bi && same(ri, bi) ? undefined : ri;           // yo lo borré (y el otro no lo tocó) → se borra
+        if (v !== undefined) out.push(v);
+      }
+      return out;
+    }
+    return l;
+  }
+  if (l && r && typeof l === 'object' && typeof r === 'object' && !Array.isArray(l) && !Array.isArray(r)) {
+    const out = {};
+    for (const k of new Set([...Object.keys(r), ...Object.keys(l)])) { const v = merge3(b && b[k], l[k], r[k], k); if (v !== undefined) out[k] = v; }
+    return out;
+  }
+  return l;   // conflicto en un valor simple: gana lo mío
+}
+function pristine() { const d = defaults(); return { T: {}, gone: {}, log: [], folders: d.folders, archive: [], templates: d.templates, clientCfg: {}, viewAll: null }; }
+function extractShared() {
+  const T = {};
+  for (const [id, t] of Object.entries(S.tickets)) { const o = {}; SH_T.forEach(k => { if (t[k] !== undefined) o[k] = t[k]; }); T[id] = o; }
+  const d = { T, gone: S.gone || {}, log: S.log || [] };
+  SH_TOP.forEach(k => d[k] = S[k]);
+  return JSON.parse(JSON.stringify(d));
+}
+function mergeTop(base, local, remote) {
+  const out = {};
+  for (const k of new Set([...Object.keys(local), ...Object.keys(remote)])) out[k] = remote[k] === undefined ? local[k] : (local[k] === undefined ? remote[k] : merge3(base[k], local[k], remote[k], k));
+  out.log = (out.log || []).sort((a, b) => a.at - b.at).slice(-200);
+  return out;
+}
+function applyShared(d) {
+  d = JSON.parse(JSON.stringify(d));   // sin compartir referencias con la base ni con el remoto
+  SH_TOP.forEach(k => { if (d[k] !== undefined) S[k] = d[k]; });
+  S.gone = d.gone || {}; S.log = d.log || [];
+  for (const [id, f] of Object.entries(d.T || {})) {
+    const t = S.tickets[id]; if (!t) continue;
+    SH_T.forEach(k => { if (f[k] !== undefined) t[k] = f[k]; });
+  }
+  for (const id of Object.keys(S.gone)) if (S.tickets[id]) { delete S.tickets[id]; UI.tabs = UI.tabs.filter(x => x !== id); if (UI.route.v === 'ticket' && UI.route.id === id) UI.route = { v: 'dash', id: 'all' }; }
+  Object.values(S.tickets).forEach(t => { t._sh = true; if (!Array.isArray(t.steps)) t.steps = []; if (!Array.isArray(t.reminders)) t.reminders = []; if (!Array.isArray(t.meetings)) t.meetings = []; if (!t.converted) t.converted = {}; });
+}
+const mkLog = (tid, by, txt) => ({ id: `${by}|${tid}|${hid(txt)}|${Math.floor(Date.now() / 600000)}`, at: Date.now(), by, tid, txt });
+/* Convierte mis cambios (frente a lo último sincronizado) en frases para el registro del equipo */
+function logChanges(base) {
+  const me = meName() || '?', B = base.T || {}, out = [], ids = a => new Map((a || []).map(x => [x.id, x]));
+  for (const [id, t] of Object.entries(S.tickets)) {
+    const b = B[id]; if (!b) continue;
+    const parts = [], bs = ids(b.steps), added = (t.steps || []).filter(s => !bs.has(s.id)), mine = added.filter(s => s.by !== 'IA'), ia = added.filter(s => s.by === 'IA');
+    const done = (t.steps || []).filter(s => s.done && bs.has(s.id) && !bs.get(s.id).done && s.doneBy !== 'IA'), removed = [...bs.values()].filter(s => !(t.steps || []).some(x => x.id === s.id));
+    if (mine.length) parts.push(`agregó ${mine.length} paso(s)`);
+    if (done.length) parts.push(`completó ${done.length} paso(s)`);
+    if (removed.length) parts.push(`eliminó ${removed.length} paso(s)`);
+    const bp = ids(b.plan), np = (t.plan || []).filter(p => !bp.has(p.id)).length; if (np) parts.push(`agregó ${np} ítem(s) al plan`);
+    const bm = ids(b.meetings); if ((t.meetings || []).some(m => !bm.has(m.id))) parts.push('registró una reunión');
+    const br = ids(b.reminders); if ((t.reminders || []).some(r => !br.has(r.id) && !/^auto/.test(r.source || ''))) parts.push('agregó un recordatorio');
+    if (!same(t.notes, b.notes)) parts.push('editó las notas');
+    if (!same(t.internal, b.internal)) parts.push(`cambió el estado a «${t.internal || 'automático'}»`);
+    if (!same(t.deliveryManual, b.deliveryManual)) parts.push('puso la fecha de entrega');
+    if (!same(t.rep, b.rep)) parts.push('actualizó el Status');
+    if (parts.length) out.push(mkLog(id, me, parts.join(', ')));
+    if (ia.length) out.push(mkLog(id, 'IA', `agregó ${ia.length} paso(s) al analizar el ticket`));
+  }
+  const have = new Set((S.log || []).map(l => l.id));
+  const fresh = out.filter(l => !have.has(l.id) && !(S.log || []).some(x => x.by === l.by && x.tid === l.tid && x.txt === l.txt && l.at - x.at < 30 * 60000));
+  if (fresh.length) S.log = (S.log || []).concat(fresh).slice(-200);
+}
+async function syncShared(manual) {
+  if (!configured() || !S.settings.syncKV || SH.busy) return;
+  if (C.health && C.health.kv === false) { SH.err = 'KV no configurado en el Worker'; if (manual) toast(SH.err, 'err'); return; }
+  SH.busy = true; SH.quiet = true;
+  let applied = false;
+  try {
+    let remote = null;
+    for (let tries = 0; tries < 4; tries++) {
+      const base = SH.base ? SH.base.data : pristine();
+      if (SH.base) logChanges(base);
+      const local = extractShared();
+      if (!remote) {
+        const res = await api('/state?rev=' + (SH.base ? SH.rev : 0));
+        remote = res.same ? { rev: res.rev, data: base } : { rev: res.rev || 0, data: res.data || null };
+      }
+      const merged = remote.data ? mergeTop(base, local, remote.data) : local;
+      const hyd = Object.values(S.tickets).some(t => !t._sh);
+      if (hyd || !same(merged, local)) { applyShared(merged); applied = true; }
+      const needPush = canEdit() && !same(merged, remote.data || {});
+      if (!needPush) { saveBase(remote.rev, merged); break; }
+      try {
+        const r = await api('/state', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ base: remote.rev, data: merged }) });
+        saveBase(r.rev, merged); SH.at = r.at || Date.now(); SH.by = meName();
+        break;
+      } catch (e) {
+        if (e.status === 409 && e.body && e.body.doc) { remote = { rev: e.body.rev, data: e.body.doc.data }; continue; }
+        throw e;
+      }
+    }
+    SH.err = ''; SH.last = Date.now();
+    if (manual) toast('Datos sincronizados con el equipo');
+  } catch (e) { SH.err = e.message; if (manual) toast('Sincronización: ' + e.message, 'err'); }
+  finally { SH.busy = false; save(); SH.quiet = false; if (applied || manual) softRender(); }
+}
+function saveBase(rev, data) { SH.rev = rev; SH.base = { rev, data: JSON.parse(JSON.stringify(data)) }; try { localStorage.setItem(BASE_K, JSON.stringify(SH.base)); } catch (e) { /* sin espacio: la próxima vez se vuelve a unir todo */ } }
+try { const b = JSON.parse(localStorage.getItem(BASE_K)); if (b && b.data) { SH.base = b; SH.rev = b.rev || 0; } } catch (e) { }
+function kvSoon() { if (!S.settings.syncKV || !configured() || SH.quiet) return; clearTimeout(SH.timer); SH.timer = setTimeout(() => syncShared(), 12000); }
+
+/* ---------- responsables y faltantes ---------- */
+const agentName = t => { const a = C.users[t.assigneeId]; return a ? a.name : ''; };
+const contactName = t => { const u = C.users[t.requesterId]; return u ? u.name : ''; };
+function teamNames(t) {
+  const s = new Set();
+  (C.comments[t.id] || []).filter(c => c.side === 'inference' && c.author).forEach(c => s.add(c.author));
+  if (agentName(t)) s.add(agentName(t));
+  whoSuggestions().forEach(w => s.add(w));
+  return [...s].slice(0, 14);
+}
+function whoOf(t) {
+  const set = new Set();
+  openSteps(t).forEach(s => s.who && set.add(s.who));
+  (t.plan || []).filter(p => !p.done && p.who).forEach(p => set.add(p.who));
+  zdItems(t).forEach(i => i.who && set.add(i.who));
+  const names = [...set]; if (!names.length && agentName(t)) names.push(agentName(t));
+  const ns = nextStep(t);
+  return { names, dep: ns ? (ns.owner === 'cliente' ? 'Cliente' : 'Inference') : '' };
+}
+function gapsOf(t) {
+  if (t.zdClosed) return [];
+  const g = [], os = openSteps(t);
+  if (t.type !== 'dt' && !deliveryOf(t)) g.push('Sin fecha de entrega');
+  if (C.channels.length && !t.slackId) g.push('Sin canal de Slack');
+  if (!os.length) g.push('Sin siguiente paso registrado');
+  const nw = os.filter(s => !s.who).length; if (nw) g.push(`${nw} actividad(es) sin encargado`);
+  if (t.type !== 'dt' && zdHours(t) === null && !(t.rep && t.rep.hEst)) g.push('Sin horas estimadas');
+  if (clientWaiting(t)) g.push('El cliente espera respuesta');
+  const od = os.filter(s => s.due && parseDue(s.due) < new Date()).length; if (od) g.push(`${od} pendiente(s) vencido(s)`);
+  return g;
+}
+const aiGaps = t => (t.ai && t.ai.data && Array.isArray(t.ai.data.faltantes) ? t.ai.data.faltantes : []).map(x => String(x || '').trim()).filter(Boolean);
+const allGaps = t => { const g = gapsOf(t), seen = new Set(g.map(norm)); aiGaps(t).forEach(x => { if (!seen.has(norm(x))) { g.push(x); seen.add(norm(x)); } }); return g; };
+const gapChips = (t, max = 3) => { const g = allGaps(t); return g.length ? g.slice(0, max).map(x => `<span class="gap">${esc(trunc(x, 44))}</span>`).join('') + (g.length > max ? `<span class="gap more" title="${esc(g.slice(max).join(' · '))}">+${g.length - max}</span>` : '') : '<span class="muted">—</span>'; };
+const aiStatus = t => { const e = t.ai && t.ai.data && t.ai.data.estado; return e && STATUSES.includes(e) && aiFresh(t) ? e : ''; };
+function respHTML(t) {
+  const r = t.rep && t.rep.resp; if (r) return esc(r);
+  const w = whoOf(t);
+  return (w.names.length ? `<div>${esc(w.names.join(', '))}</div>` : '<div class="muted">sin encargado</div>') + (w.dep ? `<div class="muted sm">Depende de: ${w.dep}</div>` : '');
+}
+
+/* ---------- seguimiento automático con IA ---------- */
+const SCHEMA_AUTO = `Esquema JSON: {"estado":"En Inference|Esperando cliente|Esperando proveedor|En pruebas|En espera|Bloqueado|Cerrado","resumen":"en qué estamos, máx 3 líneas, redactado para un reporte al cliente","ultimo_avance":"qué cambió lo último","siguientes_pasos":[${ITEM}],"pendientes":[${ITEM}],"completados":[números de la lista «Pendientes ya registrados» que según las conversaciones ya se cumplieron],"fechas":[{"fecha":"YYYY-MM-DD","hora":"HH:MM o null","texto":"qué ocurre ese día","fuente":"zendesk|slack"}],"alertas":["riesgos o cosas que requieren atención"],"faltantes":["datos, aprobaciones, fechas o responsables que faltan para avanzar y que el PM debe pedir"]}. En cada paso indica "encargado": una persona del EQUIPO INFERENCE si lo hace Inference, o el contacto del cliente si lo hace el cliente; y el "area". No repitas los pendientes ya registrados. Máximo 5 siguientes_pasos y 5 pendientes.`;
+const AUTO = { fail: {}, hist: [], next: 0, cur: '', batch: null };
+const aiFresh = t => !!(t.ai && t.ai.upd !== undefined && new Date(t.ai.upd || 0) >= new Date(t.updatedAt || 0) && parseFloat(t.ai.slk || 0) >= parseFloat(t.lastSlackTs || 0));
+const hasContent = t => (C.comments[t.id] || []).length > 0 || (C.slack[t.id] || []).length > 0;
+const needsAI = t => !t.zdClosed && hasContent(t) && !aiFresh(t);
+function aiQueue() {
+  const vis = new Set(UI.route.v === 'status' ? statusList().list.map(t => t.id) : UI.route.v === 'dash' ? (() => { const d = curDash(); return filterTickets(d ? d.filters : UI.fAll).map(t => t.id); })() : []);
+  return Object.values(S.tickets).filter(t => needsAI(t) && !(AUTO.fail[t.id] > Date.now()))
+    .sort((a, b) => (vis.has(a.id) ? 0 : 1) - (vis.has(b.id) ? 0 : 1) || lastActivity(b) - lastActivity(a));
+}
+function autoStatus() {
+  const open = Object.values(S.tickets).filter(t => !t.zdClosed && hasContent(t)), q = aiQueue();
+  const hour = AUTO.hist.filter(x => Date.now() - x < 3600e3).length;
+  return { total: open.length, done: open.length - open.filter(needsAI).length, queued: q.length, hour, max: +S.settings.aiPerHour || 14, wait: Math.max(0, AUTO.next - Date.now()) };
+}
+async function autoTick() {
+  if (!S.settings.autoAI || !configured() || !canEdit() || AUTO.cur || AUTO.batch || UI.route.v === 'login') return;
+  if (C.health && !C.health.ai) return;
+  if (Date.now() < AUTO.next) return;
+  AUTO.hist = AUTO.hist.filter(x => Date.now() - x < 3600e3);
+  if (AUTO.hist.length >= (+S.settings.aiPerHour || 14)) return;
+  const t = aiQueue()[0]; if (!t) return;
+  await analyzeQuiet(t);
+}
+async function analyzeQuiet(t, force) {
+  AUTO.cur = t.id; UI.busy['ai' + t.id] = true; AUTO.hist.push(Date.now());
+  try {
+    await analyzeCore(t, { auto: true });
+    AUTO.next = Date.now() + 20000;
+  } catch (e) {
+    AUTO.fail[t.id] = Date.now() + 20 * 60000;
+    AUTO.next = Date.now() + (e.status === 429 ? 5 * 60000 : 60000);
+    UI.aiErr = e.message;
+    if (force) toast('IA: ' + e.message, 'err');
+  } finally { AUTO.cur = ''; UI.busy['ai' + t.id] = false; save(); softRender(); }
+}
+async function aiBatch(list) {
+  if (AUTO.batch) return;
+  const todo = list.filter(needsAI); if (!todo.length) return toast('Todo está analizado al día');
+  AUTO.batch = { n: 0, of: todo.length }; render();
+  for (const t of todo) {
+    if (!S.tickets[t.id]) continue;
+    try { UI.busy['ai' + t.id] = true; await analyzeCore(t, { auto: true }); AUTO.hist.push(Date.now()); }
+    catch (e) { toast(`#${t.id}: ${e.message}`, 'err'); if (e.status === 429) break; }
+    finally { UI.busy['ai' + t.id] = false; }
+    AUTO.batch.n++; save(); softRender(); await sleep(2500);
+  }
+  AUTO.batch = null; save(); render(); toast('Análisis automático terminado');
+}
+async function analyzeCore(t, o = {}) {
+  const auto = !!o.auto, extra = auto ? '' : (UI.extra[t.id] || '').trim();
+  const user = `Hoy es ${todayStr()}.\n\nEQUIPO INFERENCE (posibles encargados): ${teamNames(t).join(', ') || '(desconocido)'}\nCONTACTO DEL CLIENTE: ${contactName(t) || '(desconocido)'}\n\n${ctxTicket(t, auto ? 4500 : 7000, auto ? 3000 : 5000)}${extra ? '\n\n=== INFORMACIÓN EXTRA que pegó el PM ===\n' + extra.slice(0, 4000) : ''}\n\n${o.instruction ? 'Instrucción adicional del PM para las respuestas: ' + o.instruction + '\n\n' : ''}${auto ? SCHEMA_AUTO : SCHEMA_TICKET + ' Además agrega "completados":[números de los pendientes ya registrados que ya se cumplieron] y "faltantes":["lo que falta para avanzar"].'}`;
+  const d = parseJSON(await ai(SYS, user, auto ? { tries: 2 } : {}));
+  if (auto && !d.respuestas && t.ai && t.ai.data && t.ai.data.respuestas) d.respuestas = t.ai.data.respuestas;
+  t.ai = { ts: Date.now(), upd: t.updatedAt || '', slk: t.lastSlackTs || '0', auto, data: d };
+  applyAI(t, d);
+}
+function applyAI(t, d) {
+  const open = openSteps(t);
+  (Array.isArray(d.completados) ? d.completados : []).forEach(n => { const s = open[(parseInt(n, 10) || 0) - 1]; if (s && !s.done) { s.done = true; s.doneBy = 'IA'; s.doneAt = Date.now(); } });
+  (d.siguientes_pasos || []).slice(0, 6).forEach(x => pushStep(t, 'siguiente', x, 'IA'));
+  (d.pendientes || []).slice(0, 6).forEach(x => pushStep(t, 'pendiente', x, 'IA'));
+  if (S.settings.autoDates) (d.fechas || []).forEach(f => {
+    const today = isoDay(new Date()), key = `ai|${f.fecha}|${f.hora || ''}|${norm(f.texto).slice(0, 24)}`;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(f.fecha)) || f.fecha < today || t.converted[key]) return;
+    t.converted[key] = 1;
+    t.reminders.push({ id: 'ai:' + hid(key), text: String(f.texto || 'Fecha detectada'), due: /^\d{2}:\d{2}$/.test(String(f.hora)) ? `${f.fecha}T${f.hora}` : f.fecha, done: false, source: 'auto · IA' });
+  });
+  const fa = aiGaps(t).slice(0, 2);
+  if (fa.length) alertOnce(`gap:${t.id}:${hid(fa.join('|'))}`, t.id, 'seguimiento', `#${t.id} · Falta: ${fa.map(x => trunc(x, 70)).join(' · ')}`);
+}
+function gapDigest() {
+  const key = 'gapsday:' + isoDay(new Date());
+  if (S.notified[key]) return;
+  const list = Object.values(S.tickets).filter(t => !t.zdClosed && gapsOf(t).length);
+  if (!list.length) return;
+  alertOnce(key, '', 'faltan', `${list.length} ticket(s) con datos por completar (fecha de entrega, encargado, siguiente paso…): ${list.slice(0, 5).map(t => '#' + t.id).join(', ')}${list.length > 5 ? '…' : ''}. Mira la columna «Faltan» en el dashboard.`);
+}
+async function briefAI(list) {
+  UI.busy.brief = true; render();
+  try {
+    const line = t => { const ns = nextStep(t), w = whoOf(t), dv = deliveryOf(t), a = t.ai && t.ai.data; return `#${t.id} | ${t.type.toUpperCase()} | ${t.client || '-'} | ${statusOf(t)} | ${trunc(a && a.resumen || t.subject, 150)} | siguiente: ${ns ? ns.text + ' (' + OWN[ns.owner] + (ns.due ? ', ' + fmtDue(ns.due) : '') + ')' : 'sin definir'} | encargados: ${w.names.join(', ') || '—'} | entrega: ${dv ? fmtDue(dv.date) : 'sin fecha'} | faltan: ${allGaps(t).join('; ') || '—'}`; };
+    const txt = await ai('Eres el asistente de un Project Manager de Inference Labs9. Con las líneas de sus tickets redacta en español, breve y accionable: 1) «Prioridades de hoy» (máx 5, en orden, con #ticket y por qué), 2) «Riesgos», 3) «Qué hay que pedir o completar» (datos faltantes, a quién). No inventes datos.', `Hoy es ${todayStr()}.\n` + list.slice(0, 40).map(line).join('\n'), { json: false });
+    UI.brief = { text: txt.trim(), at: Date.now() };
+  } catch (e) { toast('IA: ' + e.message, 'err'); }
+  UI.busy.brief = false; render();
+}
+function aiStrip(list) {
+  const a = autoStatus(), on = S.settings.autoAI;
+  const pct = a.total ? Math.round(a.done * 100 / a.total) : 100;
+  return `<div class="aistrip noprint"><div class="row sp wrap"><div class="row wrap" style="gap:10px">${ic('spark', 16)}<b>Asistente IA</b>
+    <span class="pill ${on ? 'p-green' : 'p-grey'}">${on ? 'Seguimiento automático' : 'Automático apagado'}</span>
+    <span class="muted sm">${AUTO.batch ? `Analizando ${AUTO.batch.n}/${AUTO.batch.of}…` : AUTO.cur ? `Analizando #${AUTO.cur}…` : `${a.done} de ${a.total} tickets al día (${pct}%)${a.queued && on ? ` · ${a.queued} en cola` : ''}`}</span>${UI.aiErr && a.queued ? `<span class="muted sm" title="${esc(UI.aiErr)}" style="color:var(--amber)">⚠ ${esc(trunc(UI.aiErr, 60))}</span>` : ''}</div>
+    <div class="row wrap">${canEdit() ? `<button class="btn sm" data-act="aiBatch" ${AUTO.batch ? 'disabled' : ''}>${ic('refresh', 13)} Analizar ahora los pendientes</button>` : ''}<button class="btn sm pri" data-act="briefAI" ${UI.busy.brief || !canEdit() ? 'disabled' : ''}>${ic('spark', 13)} ${UI.busy.brief ? 'Pensando…' : 'Resumen y prioridades'}</button></div></div>
+    ${UI.brief ? `<div class="aibox" style="margin:10px 0 0"><div class="row sp"><h4>Prioridades (${ago(UI.brief.at)})</h4><div class="row"><button class="btn sm" data-act="copyEl" data-el="briefTxt">${ic('copy', 13)}</button><button class="btn sm" data-act="briefClose">${ic('x', 13)}</button></div></div><pre class="pre" id="briefTxt">${esc(UI.brief.text)}</pre></div>` : ''}</div>`;
+}
+/* Caja «Seguimiento automático» para la pestaña Seguimiento del ticket */
+function autoBox(t) {
+  const a = t.ai && t.ai.data, g = allGaps(t), fresh = aiFresh(t), busy = UI.busy['ai' + t.id];
+  const log = (S.log || []).filter(l => l.tid === t.id).sort((x, y) => y.at - x.at).slice(0, 5);
+  return `<div class="sec autobox"><div class="row sp"><h3>${ic('spark', 15)} Seguimiento automático</h3><span class="muted sm">${busy ? 'Analizando…' : t.ai ? `Analizado ${ago(t.ai.ts)}${t.ai.auto ? ' (automático)' : ''}${fresh ? '' : ' · hay novedades sin analizar'}` : (S.settings.autoAI ? 'Pendiente en la cola de análisis' : 'Sin analizar')}</span></div>
+    ${a && a.resumen ? `<p style="margin:6px 0">${esc(a.resumen)}</p>` : `<div class="muted" style="margin:6px 0">${busy ? 'La IA está leyendo Zendesk y Slack…' : 'Aún no hay análisis. Se hace solo; también puedes pulsar «Analizar» en el panel derecho.'}</div>`}
+    ${g.length ? `<div class="gapbox"><b>Falta o requiere atención:</b><ul class="clean">${g.map(x => `<li>${esc(x)}</li>`).join('')}</ul></div>` : (a ? '<div class="muted sm">No se detectan faltantes.</div>' : '')}
+    ${log.length ? `<div class="muted sm" style="margin-top:8px">Últimos cambios: ${log.map(l => `<b>${esc(l.by === 'IA' ? 'IA' : prettyUser(l.by))}</b> ${esc(l.txt)} (${ago(l.at)})`).join(' · ')}</div>` : ''}</div>`;
 }
 
 /* =====================================================================
@@ -1511,13 +1835,17 @@ const T_ = id => S.tickets[id];
 const validDate = s => /^\d{4}-\d{2}-\d{2}$/.test(String(s || '')) ? s : '';
 function pushStep(t, type, x, src) {
   const text = String(x.texto || '').trim(); if (!text) return false;
-  if ((t.steps || []).some(s => !s.done && norm(s.text) === norm(text))) return false;
-  t.steps.push({ id: uid(), type, text, owner: x.responsable === 'cliente' ? 'cliente' : 'inference', due: validDate(x.vence), start: '', area: String(x.area || '').trim(), who: String(x.encargado || '').trim(), done: false, src });
+  if ((t.steps || []).some(s => norm(s.text) === norm(text))) return false;
+  const owner = x.responsable === 'cliente' ? 'cliente' : 'inference';
+  const ia = /^IA/.test(src || '');
+  const who = String(x.encargado || '').trim() || (owner === 'cliente' ? contactName(t) : agentName(t));
+  t.steps.push({ id: ia ? 'ia_' + hid(norm(text)) : uid(), type, text, owner, due: validDate(x.vence), start: '', area: String(x.area || '').trim(), who, done: false, src, by: ia ? 'IA' : meName() });
   return true;
 }
 
 const ACT = {
   doLogin: async () => {
+    AUTO.fail = {}; AUTO.next = 0;
     const url = $('#lg_url').value.trim().replace(/\/+$/, ''), user = $('#lg_user').value.trim(), pass = $('#lg_pass').value, rem = $('#lg_rem').checked;
     UI.loginForm = { url, user };
     if (!url || !user || !pass) { UI.loginMsg = 'Completa usuario, contraseña y URL del Worker'; return render(); }
@@ -1525,14 +1853,14 @@ const ACT = {
     try { await login(url, user, pass, rem); }
     catch (e) { UI.loginMsg = e.message; return render(); }
     UI.loginMsg = ''; render(); startTimers();
-    await loadHealth(); await syncAll();
+    await loadHealth(); await loadMe(); await syncShared(); await syncAll();
   },
   logout: () => { if (confirm('¿Cerrar sesión? Se borra de este navegador la caché de mensajes; tus pendientes y notas se conservan.')) logout('Sesión cerrada.'); },
   nav: d => go(d.v, d.id),
   bell: () => { UI.bell = !UI.bell; render(); },
   alertGo: d => { const a = S.notifications.find(x => x.id === d.aid); if (a) a.read = true; save(); UI.bell = false; d.id && S.tickets[d.id] ? go('ticket', d.id) : go(a && a.kind === 'cal' ? 'cal' : 'daily'); },
   alertsRead: () => { S.notifications.forEach(a => a.read = true); save(); render(); },
-  openTicket: d => { $('#modal').innerHTML = ''; go('ticket', d.id); },
+  openTicket: d => { $('#modal').innerHTML = ''; go('ticket', d.id); const t = T_(d.id); if (t && canEdit() && S.settings.autoAI && needsAI(t) && !AUTO.cur && !AUTO.batch) analyzeQuiet(t); },
   calNav: d => { const c = UI.cal, n = +d.n; if (!n) { c.y = new Date().getFullYear(); c.m = new Date().getMonth(); } else { const x = new Date(c.y, c.m + n, 1); c.y = x.getFullYear(); c.m = x.getMonth(); } render(); },
   calType: d => { const c = UI.cal; c.types = c.types.includes(d.t) ? c.types.filter(x => x !== d.t) : [...c.types, d.t]; render(); },
   calDay: d => { const list = calEvents(UI.cal).filter(e => e.date === d.d).sort((a, b) => KORD[a.kind] - KORD[b.kind]); openModal(`<div class="row sp"><h2>${esc(fmtDue(d.d))}</h2><button class="btn" data-act="closeModal">Cerrar</button></div><div style="margin-top:10px">${list.map(evChip).join('')}</div>`); },
@@ -1563,7 +1891,7 @@ const ACT = {
   addStep: d => {
     const t = T_(d.id), text = $('#ns_text').value.trim(); if (!text) return toast('Escribe la descripción', 'err');
     const date = $('#ns_date').value, time = $('#ns_time').value;
-    t.steps.push({ id: uid(), type: $('#ns_type').value, text, owner: $('#ns_owner').value, due: date ? (time ? `${date}T${time}` : date) : '', start: ($('#ns_start') || {}).value || '', area: ($('#ns_area') || {}).value || '', who: (($('#ns_who') || {}).value || '').trim(), done: false, src: 'manual' });
+    t.steps.push({ id: uid(), type: $('#ns_type').value, text, owner: $('#ns_owner').value, due: date ? (time ? `${date}T${time}` : date) : '', start: ($('#ns_start') || {}).value || '', area: ($('#ns_area') || {}).value || '', who: (($('#ns_who') || {}).value || '').trim() || (($('#ns_owner').value === 'cliente' ? contactName(t) : agentName(t)) || ''), done: false, src: 'manual', by: meName() });
     save(); render();
   },
   delStep: d => { const t = T_(d.id); t.steps = t.steps.filter(s => s.id !== d.sid); save(); render(); },
@@ -1640,8 +1968,29 @@ const ACT = {
   testConn: async () => { await loadHealth(); render(); C.health ? toast('Conexión correcta') : toast(UI.err || 'No se pudo conectar', 'err'); },
   askNotif: async () => { if ('Notification' in window) await Notification.requestPermission(); render(); },
   exportData: () => { const o = { settings: { ...S.settings } }; KV_KEYS.forEach(k => o[k] = S[k]); download(`pm-hub-${isoDay(new Date())}.json`, JSON.stringify(o, null, 1), 'application/json'); },
-  kvPush: () => kvPush(true),
-  kvPull: () => kvPull(),
+  syncNow: () => syncShared(true),
+  aiBatch: () => { const d = curDash(); aiBatch(UI.route.v === 'status' ? statusList().list : filterTickets(d ? d.filters : UI.fAll)); },
+  stAI: () => aiBatch(statusList().list),
+  briefAI: () => { const d = curDash(); briefAI(UI.route.v === 'status' ? statusList().list : filterTickets(d ? d.filters : UI.fAll)); },
+  briefClose: () => { UI.brief = null; render(); },
+  userCreate: async () => {
+    const u = norm(($('#um_user') || {}).value || '').trim().replace(/\s+/g, '.').replace(/[^a-z0-9._-]/g, ''), r = ($('#um_role') || {}).value || 'editor';
+    if (u.length < 2) return toast('Escribe un usuario (letras y números, mínimo 2)', 'err');
+    const pass = genPass(14);
+    try { await api('/users', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ user: u, password: pass, role: r }) }); UI.um.cred = { user: u, pass, role: r }; await loadUsers(); render(); toast('Usuario creado'); }
+    catch (e) { toast(e.message, 'err'); }
+  },
+  userReset: async d => {
+    const pass = genPass(14), x = UI.um.users.find(z => z.user === d.u); if (!x || !confirm(`¿Generar una nueva contraseña para ${d.u}? La anterior deja de servir.`)) return;
+    try { await api('/users', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ user: d.u, password: pass, role: x.role }) }); UI.um.cred = { user: d.u, pass, role: x.role }; render(); }
+    catch (e) { toast(e.message, 'err'); }
+  },
+  userDel: async d => {
+    if (!confirm(`¿Eliminar el acceso de ${d.u}? Su sesión se cierra al instante.`)) return;
+    try { await api('/users/delete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ user: d.u }) }); await loadUsers(); toast('Usuario eliminado'); }
+    catch (e) { toast(e.message, 'err'); }
+  },
+  copyCred: () => { const c = UI.um.cred; if (c) copy(`Hola, te creé acceso a PM Hub.\nURL: ${location.origin}${location.pathname}\nUsuario: ${c.user}\nContraseña: ${c.pass}\nRol: ${ROLE_LABEL[c.role]}\nTe recomiendo guardarla en tu gestor de contraseñas.`); },
   /* v1.5 · status, gantt, vistas, usuarios */
   stType: d => { const s = UI.st; s.types = s.types.includes(d.t) ? s.types.filter(x => x !== d.t) : [...s.types, d.t]; render(); },
   stEdit: () => { UI.st.edit = !UI.st.edit; render(); },
@@ -1678,14 +2027,13 @@ const ACT = {
   delPlan: d => { const t = T_(d.id); t.plan = (t.plan || []).filter(p => p.id !== d.pid); save(); render(); },
   viewEdit: () => viewEditor(),
   viewLevel: d => { curView().level = d.l; save(); render(); },
-  genUser: () => {
-    const u = norm((($('#nu_user') || {}).value || '').trim()).replace(/\s+/g, '.').replace(/[^a-z0-9._-]/g, '');
-    if (!u) return toast('Escribe un usuario (letras y números)', 'err');
-    UI.nu = { user: u, pass: genPass(20) }; render();
-  },
 };
 
 const CH = {
+  userRole: async el => {
+    try { await api('/users', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ user: el.dataset.u, role: el.value }) }); await loadUsers(); toast('Rol actualizado'); }
+    catch (e) { toast(e.message, 'err'); await loadUsers(); }
+  },
   repField: el => { const r = repOf(T_(el.dataset.id)); r[el.dataset.k] = el.value; save(); render(); },
   repHours: el => { const r = repOf(T_(el.dataset.id)); if (el.value === '') delete r.hours[UI.st.month]; else r.hours[UI.st.month] = parseFloat(el.value) || 0; save(); render(); },
   cfgField: el => { cfgOf(el.dataset.c)[el.dataset.k] = el.value; save(); render(); },
@@ -1730,10 +2078,12 @@ document.addEventListener('click', e => {
   if (UI.bell && !e.target.closest('.bellmenu') && !e.target.closest('[data-act="bell"]')) { UI.bell = false; render(); }
   const el = e.target.closest('[data-act]'); if (!el) return;
   if (el.tagName === 'A') e.preventDefault();
+  if (!roGuard('act', el.dataset.act)) return;
   const fn = ACT[el.dataset.act]; if (fn) fn(el.dataset, el, e);
 });
 document.addEventListener('change', e => {
   const el = e.target.closest('[data-ch]'); if (!el) return;
+  if (!roGuard('ch', el.dataset.ch)) return;
   const fn = CH[el.dataset.ch]; if (fn) fn(el);
 });
 document.addEventListener('keydown', e => {
@@ -1750,6 +2100,6 @@ window.addEventListener('beforeunload', e => { if (REC.on) { e.preventDefault();
 /* ---------- arranque ---------- */
 (async function init() {
   render(); startTimers();
-  if (configured()) { await loadHealth(); await syncAll(); }
+  if (configured()) { await loadHealth(); await loadMe(); await syncShared(); await syncAll(); }
   tick();
 })();
