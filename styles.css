@@ -263,3 +263,25 @@ ul.clean{margin:4px 0 0;padding-left:18px}ul.clean li{margin:2px 0}
   .st-bar,.st-table th,.st-tile,.st-h,.st-foot{-webkit-print-color-adjust:exact;print-color-adjust:exact}
   .st-table tr{break-inside:avoid}
 }
+
+/* ===== v1.6: equipo, IA automática y faltantes ===== */
+.avatar{width:32px;height:32px;border-radius:50%!important;background:#1f73b7;color:#fff!important;font-size:12px;font-weight:700;display:grid;place-items:center;border:0;cursor:pointer;margin-bottom:4px}
+.avatar.admin{background:#6a27b8}.avatar.lector{background:#7d8791}
+.sync .me{display:inline-flex;align-items:center;gap:6px;margin-right:10px;color:var(--ink);font-size:12.5px;white-space:nowrap}
+.sdot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#2e9e5b}.sdot.bad{background:var(--red)}
+.online{display:inline-block;width:8px;height:8px;border-radius:50%;background:#2e9e5b;margin-right:5px}
+.ro-banner{background:var(--amber-bg);color:var(--amber);padding:8px 22px;font-size:13px;border-bottom:1px solid #f3d28a}
+.aistrip{border:1px solid #d6e4f2;background:#f2f8fd;border-radius:8px;padding:9px 14px;margin:12px 20px 0}
+.stp .aistrip{margin:0 0 12px}
+.aistrip .pre{max-height:280px;overflow:auto;white-space:pre-wrap;font-family:inherit;font-size:13px;margin:6px 0 0}
+.gap{display:inline-block;background:var(--amber-bg);color:var(--amber);border-radius:10px;padding:1px 8px;font-size:11.5px;margin:1px 3px 1px 0;white-space:nowrap}
+.gap.more{background:#eceef0;color:var(--muted)}
+.gapbox{background:var(--amber-bg);border:1px solid #f3d28a;border-radius:8px;padding:8px 12px;margin-top:8px;font-size:13px}
+.gapbox ul{margin:4px 0 0 18px}
+.autobox{border:1px solid #d6e4f2;background:#f8fbfe;border-radius:8px;padding:12px 14px}
+.gapdet{border:1px solid #f3d28a;background:#fffaf0;border-radius:8px;padding:8px 12px}
+.gapdet summary{cursor:pointer;font-size:13px}
+.tb td .muted.sm{line-height:1.3}
+@media print{.aistrip,.gapdet,.ro-banner{display:none!important}}
+
+.tk-body table.tb .mini{min-width:110px}.tk-body table.tb td{vertical-align:top}
