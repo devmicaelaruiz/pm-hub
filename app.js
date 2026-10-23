@@ -4,7 +4,7 @@
    Web estática (GitHub Pages) + proxy Cloudflare Worker (Zendesk, Slack, IA)
    ===================================================================== */
 
-const VERSION = 'v1.6 · usuarios, equipo e IA automática';
+const VERSION = 'v1.8 · Por subsanar';
 
 /* ---------- utilidades ---------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -66,6 +66,7 @@ const ICONS = {
   mail: '<path d="M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/><polyline points="22,6 12,13 2,6"/>',
   up: '<polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>',
   logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>',
+  alert: '<path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>',
   cal: '<rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>',
   down: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
 };
@@ -95,7 +96,7 @@ function defaults() {
       workerUrl: '', pollSec: 60, slackPollSec: 120,
       keywords: 'evolutivo, deuda técnica, proyecto', internalDomains: 'inferencelabs9.com',
       myName: '', dailyTime: '17:30', staleDays: 2, leadMin: 60, replyHours: 4,
-      notif: true, includeSolved: false, syncKV: true, autoAI: true, aiPerHour: 14, autoDates: true, dateOwner: 'Giancarlo Guzmán',
+      notif: true, includeSolved: false, syncKV: true, autoAI: true, aiPerHour: 14, aiProvider: 'auto', geminiModel: '', groqModel: '', autoDates: true, dateOwner: 'Giancarlo Guzmán',
       areas: 'Tecnología, Operaciones, QA, Proyectos, Comercial, Cliente', provider: 'Inference Labs9',
     },
     folders: [{ id: 'f1', name: 'Mis dashboards', open: true, dashboards: [{ id: 'd1', name: 'Pendientes de respuesta', filters: { types: [], q: '', status: '', client: '', owner: '', slack: '', attention: true } }] }],
@@ -158,7 +159,10 @@ async function api(path, opts = {}) {
 async function ai(system, user, { json = true, tries = 3 } = {}) {
   for (let i = 0; i < tries; i++) {
     try {
-      const r = await api('/ai', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ system, user, json }) });
+      const st = S.settings, pv = st.aiProvider || 'auto';
+      const body = { system, user, json, provider: pv, model: pv === 'gemini' ? st.geminiModel : pv === 'groq' ? st.groqModel : '' };
+      const r = await api('/ai', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+      C.aiLast = { provider: r.provider, model: r.model, at: Date.now() };
       return r.text;
     } catch (e) {
       if (e.status === 429 && i < tries - 1) { const w = Math.min(60, e.retry || 20); toast(`IA gratuita al límite, reintentando en ${w}s…`); await sleep(w * 1000); continue; }
@@ -912,7 +916,7 @@ function railHTML() {
   const r = UI.route.v;
   const b = (v, icon, title) => `<button class="${r === v ? 'on' : ''}" data-act="nav" data-v="${v}" title="${title}">${ic(icon, 20)}</button>`;
   return `<nav class="rail"><div class="logo">PM</div>
-    ${b('dash', 'layout', 'Dashboards')}${b('status', 'chart', 'Status por cliente')}${b('cal', 'cal', 'Calendario: entregas, hitos y tareas')}${b('pending', 'check', 'Pendientes y siguientes pasos')}${b('daily', 'table', 'Update del día')}${b('templates', 'file', 'Plantillas')}${b('archive', 'archive', 'Archivo de cierres')}
+    ${b('dash', 'layout', 'Dashboards')}${b('status', 'chart', 'Status por cliente')}${b('cal', 'cal', 'Calendario: entregas, hitos y tareas')}${b('owed', 'alert', 'Por subsanar: lo que se debe y quién lo resuelve')}${b('pending', 'check', 'Pendientes y siguientes pasos')}${b('daily', 'table', 'Update del día')}${b('templates', 'file', 'Plantillas')}${b('archive', 'archive', 'Archivo de cierres')}
     <div class="sp"></div>
     <button class="avatar ${role()}" data-act="nav" data-v="settings" title="${esc(prettyUser(meName()))} · ${ROLE_LABEL[role()]}">${esc(inits(prettyUser(meName())))}</button>
     <button data-act="bell" title="Notificaciones">${ic('bell', 20)}<span class="dot" id="bellCount" style="display:none">0</span></button>
@@ -943,6 +947,7 @@ function viewBody() {
     case 'ticket': return S.tickets[UI.route.id] ? ticketView(S.tickets[UI.route.id]) : '<div class="empty">Ticket no encontrado</div>';
     case 'status': return statusView();
     case 'cal': return calView();
+    case 'owed': return owedView();
     case 'pending': return pendingView();
     case 'daily': return dailyView();
     case 'templates': return templatesView();
@@ -1159,6 +1164,24 @@ function archiveView() {
     ${S.archive.length ? S.archive.map((a, i) => `<div class="card" style="margin-bottom:12px"><div class="row sp"><div>${tagT(a.type || 'pry')} <b>#${esc(a.id)}</b> ${esc(a.subject)} <span class="muted sm">· ${esc(a.client || '')} · cerrado ${esc((a.closedAt || '').slice(0, 10))}</span></div><div class="row"><button class="btn sm" data-act="archCopy" data-i="${i}">${ic('copy', 13)}</button><button class="btn sm" data-act="archDl" data-i="${i}">${ic('down', 13)} .md</button><button class="btn sm danger" data-act="archDel" data-i="${i}">${ic('trash', 13)}</button></div></div><details><summary>Ver resumen</summary><pre class="pre" style="margin-top:8px">${esc(a.summary)}</pre></details></div>`).join('') : '<div class="empty">Aún no has archivado tickets.</div>'}</div>`;
 }
 
+/* ---------- modelo de IA ---------- */
+function aiModelCard() {
+  const s = S.settings, M = C.aiModels, pv = s.aiProvider || 'auto', h = C.health;
+  const opt = (v, cur, label) => `<option value="${esc(v)}" ${v === cur ? 'selected' : ''}>${esc(label || v)}</option>`;
+  const list = (arr, cur, def) => [opt('', cur, 'Automático (' + (def || 'el mejor disponible') + ')'), ...(arr || []).map(m => opt(m, cur))].join('') + (cur && !(arr || []).includes(cur) ? opt(cur, cur, cur + ' (no listado)') : '');
+  const gem = pv === 'gemini', grq = pv === 'groq';
+  return `<div class="card stack" style="margin-bottom:16px"><h3>Modelo de IA</h3>
+    <div class="muted sm">Solo se ofrecen modelos de la capa gratuita (Gemini Flash / Flash-Lite y los de Groq); los «Pro» o de pago quedan fuera. Si un modelo está saturado («alta demanda») el Worker prueba solo el siguiente gratuito.</div>
+    <div class="row wrap" style="gap:16px;align-items:flex-end">
+      <div style="min-width:180px"><label class="lb">Proveedor</label><select data-ch="aiProv"><option value="auto" ${pv === 'auto' ? 'selected' : ''}>Automático (Groq → Gemini)</option><option value="groq" ${grq ? 'selected' : ''}>Solo Groq</option><option value="gemini" ${gem ? 'selected' : ''}>Solo Gemini</option></select></div>
+      ${gem ? `<div style="min-width:240px"><label class="lb">Modelo Gemini</label><select data-ch="aiModel" data-k="geminiModel">${list(M && M.gemini, s.geminiModel, M && M.defaults.gemini)}</select></div>` : ''}
+      ${grq ? `<div style="min-width:240px"><label class="lb">Modelo Groq</label><select data-ch="aiModel" data-k="groqModel">${list(M && M.groq, s.groqModel, M && M.defaults.groq)}</select></div>` : ''}
+      <button class="btn" data-act="aiModels">${ic('refresh', 14)} Ver modelos disponibles</button><button class="btn pri" data-act="aiTest">Probar IA</button>
+    </div>
+    ${M && (M.groqError || M.geminiError) ? `<div class="login-err">${esc(M.groqError ? 'Groq: ' + M.groqError : '')} ${esc(M.geminiError ? 'Gemini: ' + M.geminiError : '')}</div>` : ''}
+    <div class="muted sm">${C.aiLast ? `Última respuesta: <b>${esc(C.aiLast.provider)}</b> · ${esc(C.aiLast.model || '')} (${ago(C.aiLast.at)}).` : h && h.ai ? `Configurado: ${esc(h.provider || '')}.` : 'La IA no está configurada en el Worker.'} ${gem || pv === 'auto' ? 'Para que Gemini no genere cobros, crea la llave en Google AI Studio con un proyecto sin facturación activada.' : ''}</div></div>`;
+}
+
 /* ---------- ajustes ---------- */
 function settingsView() {
   const s = S.settings, h = C.health;
@@ -1169,6 +1192,7 @@ function settingsView() {
     <div class="card stack" style="margin-bottom:16px"><h3>Conexión</h3>${inp('workerUrl', 'URL del Worker', 'url', 'Ej: https://pm-hub-proxy.tu-usuario.workers.dev')}
       <div class="muted sm">Sesión iniciada como <b>${esc((session() || {}).user || '')}</b>, vence ${esc(fmtTS((session() || {}).exp))}.</div>
       <div class="row"><button class="btn pri" data-act="testConn">Probar conexión</button><button class="btn" data-act="logout">${ic('logout', 14)} Cerrar sesión</button>${h ? `<span class="pill ${h.zendesk ? 'p-green' : 'p-red'}">Zendesk</span><span class="pill ${h.slack ? 'p-green' : 'p-red'}">Slack</span><span class="pill ${h.ai ? 'p-green' : 'p-red'}">IA</span><span class="pill ${h.kv ? 'p-green' : 'p-grey'}">KV</span><span class="muted sm">${esc(h.model || '')}</span>` : ''}</div></div>
+    ${aiModelCard()}
     <div class="card" style="margin-bottom:16px"><h3>Qué tickets entran</h3>${inp('keywords', 'Palabras clave del Formulario de Zendesk', 'text', 'Entran los tickets cuyo «Formulario» contenga alguna (separadas por coma): evolutivo, deuda técnica, proyecto.')}
       ${inp('internalDomains', 'Dominios del equipo Inference', 'text', 'Sirve para distinguir quién escribió: cliente o Inference.')}${chk('includeSolved', 'Incluir tickets resueltos al sincronizar')}${chk('autoDates', 'Crear recordatorios solos cuando aparezca una fecha en Zendesk, Slack o en el análisis de IA')}
       ${inp('dateOwner', 'Quién envía las fechas de entrega', 'text', 'Se usa en el Calendario y en los avisos cuando falta una fecha.')}
@@ -1504,8 +1528,8 @@ const meName = () => (session() || {}).user || '';
 const inits = n => String(n || '?').split(/[\s._-]+/).filter(Boolean).slice(0, 2).map(x => x[0].toUpperCase()).join('') || '?';
 const prettyUser = u => String(u || '').replace(/[._-]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 /* acciones permitidas al rol «lector» (solo mirar, filtrar y copiar) */
-const VIEW_ACT = new Set(['doLogin', 'logout', 'nav', 'bell', 'alertGo', 'alertsRead', 'openTicket', 'closeTab', 'calNav', 'calType', 'calDay', 'calWho', 'calClear', 'selectDash', 'toggleFolder', 'dfType', 'ttab', 'closeModal', 'refresh', 'refreshOne', 'copyEl', 'dailyCopy', 'dailyCopyHTML', 'archCopy', 'archDl', 'stType', 'stCopy', 'stPrint', 'gz', 'viewLevel', 'viewEdit', 'pendF', 'tplSel', 'tplRegen', 'tplMail', 'testConn', 'askNotif', 'exportData', 'syncNow', 'briefClose', 'copyCred']);
-const VIEW_CH = new Set(['dfilter', 'calSel', 'calOpt', 'stSel', 'stChk', 'pendOver', 'dailyScope', 'viewLevel', 'viewCol', 'viewKpi', 'viewHide', 'tplPick', 'tplText', 'extra', 'set', 'setChk']);
+const VIEW_ACT = new Set(['doLogin', 'logout', 'nav', 'bell', 'alertGo', 'alertsRead', 'openTicket', 'closeTab', 'calNav', 'calType', 'calDay', 'calWho', 'calClear', 'selectDash', 'toggleFolder', 'dfType', 'ttab', 'closeModal', 'refresh', 'refreshOne', 'copyEl', 'dailyCopy', 'dailyCopyHTML', 'archCopy', 'archDl', 'stType', 'stCopy', 'stPrint', 'gz', 'viewLevel', 'viewEdit', 'pendF', 'tplSel', 'tplRegen', 'tplMail', 'testConn', 'askNotif', 'exportData', 'syncNow', 'briefClose', 'copyCred', 'owedF', 'owedCopy', 'owedCopyBy']);
+const VIEW_CH = new Set(['dfilter', 'calSel', 'calOpt', 'stSel', 'stChk', 'pendOver', 'dailyScope', 'viewLevel', 'viewCol', 'viewKpi', 'viewHide', 'tplPick', 'tplText', 'extra', 'set', 'setChk', 'owedSel']);
 function roGuard(kind, name) {
   if (canEdit() || (kind === 'act' ? VIEW_ACT : VIEW_CH).has(name)) return true;
   toast('Tu rol es de solo lectura: puedes ver y filtrar, pero no editar.', 'err'); render();
@@ -1703,7 +1727,8 @@ function gapsOf(t) {
   const od = os.filter(s => s.due && parseDue(s.due) < new Date()).length; if (od) g.push(`${od} pendiente(s) vencido(s)`);
   return g;
 }
-const aiGaps = t => (t.ai && t.ai.data && Array.isArray(t.ai.data.faltantes) ? t.ai.data.faltantes : []).map(x => String(x || '').trim()).filter(Boolean);
+const aiGapsFull = t => (t.ai && t.ai.data && Array.isArray(t.ai.data.faltantes) ? t.ai.data.faltantes : []).map(x => typeof x === 'object' && x ? { texto: String(x.texto || x.text || '').trim(), responsable: String(x.responsable || x.encargado || '').trim() } : { texto: String(x || '').trim(), responsable: '' }).filter(x => x.texto);
+const aiGaps = t => aiGapsFull(t).map(x => x.texto);
 const allGaps = t => { const g = gapsOf(t), seen = new Set(g.map(norm)); aiGaps(t).forEach(x => { if (!seen.has(norm(x))) { g.push(x); seen.add(norm(x)); } }); return g; };
 const gapChips = (t, max = 3) => { const g = allGaps(t); return g.length ? g.slice(0, max).map(x => `<span class="gap">${esc(trunc(x, 44))}</span>`).join('') + (g.length > max ? `<span class="gap more" title="${esc(g.slice(max).join(' · '))}">+${g.length - max}</span>` : '') : '<span class="muted">—</span>'; };
 const aiStatus = t => { const e = t.ai && t.ai.data && t.ai.data.estado; return e && STATUSES.includes(e) && aiFresh(t) ? e : ''; };
@@ -1714,7 +1739,7 @@ function respHTML(t) {
 }
 
 /* ---------- seguimiento automático con IA ---------- */
-const SCHEMA_AUTO = `Esquema JSON: {"estado":"En Inference|Esperando cliente|Esperando proveedor|En pruebas|En espera|Bloqueado|Cerrado","resumen":"en qué estamos, máx 3 líneas, redactado para un reporte al cliente","ultimo_avance":"qué cambió lo último","siguientes_pasos":[${ITEM}],"pendientes":[${ITEM}],"completados":[números de la lista «Pendientes ya registrados» que según las conversaciones ya se cumplieron],"fechas":[{"fecha":"YYYY-MM-DD","hora":"HH:MM o null","texto":"qué ocurre ese día","fuente":"zendesk|slack"}],"alertas":["riesgos o cosas que requieren atención"],"faltantes":["datos, aprobaciones, fechas o responsables que faltan para avanzar y que el PM debe pedir"]}. En cada paso indica "encargado": una persona del EQUIPO INFERENCE si lo hace Inference, o el contacto del cliente si lo hace el cliente; y el "area". No repitas los pendientes ya registrados. Máximo 5 siguientes_pasos y 5 pendientes.`;
+const SCHEMA_AUTO = `Esquema JSON: {"estado":"En Inference|Esperando cliente|Esperando proveedor|En pruebas|En espera|Bloqueado|Cerrado","resumen":"en qué estamos, máx 3 líneas, redactado para un reporte al cliente","ultimo_avance":"qué cambió lo último","siguientes_pasos":[${ITEM}],"pendientes":[${ITEM}],"completados":[números de la lista «Pendientes ya registrados» que según las conversaciones ya se cumplieron],"fechas":[{"fecha":"YYYY-MM-DD","hora":"HH:MM o null","texto":"qué ocurre ese día","fuente":"zendesk|slack"}],"alertas":["riesgos o cosas que requieren atención"],"faltantes":[{"texto":"dato, aprobación, fecha o responsable que falta para avanzar","responsable":"persona (del EQUIPO INFERENCE o contacto del cliente) que debe resolverlo"}]}. En cada paso indica "encargado": una persona del EQUIPO INFERENCE si lo hace Inference, o el contacto del cliente si lo hace el cliente; y el "area". No repitas los pendientes ya registrados. Máximo 5 siguientes_pasos y 5 pendientes.`;
 const AUTO = { fail: {}, hist: [], next: 0, cur: '', batch: null };
 const aiFresh = t => !!(t.ai && t.ai.upd !== undefined && new Date(t.ai.upd || 0) >= new Date(t.updatedAt || 0) && parseFloat(t.ai.slk || 0) >= parseFloat(t.lastSlackTs || 0));
 const hasContent = t => (C.comments[t.id] || []).length > 0 || (C.slack[t.id] || []).length > 0;
@@ -1818,6 +1843,76 @@ function autoBox(t) {
     ${a && a.resumen ? `<p style="margin:6px 0">${esc(a.resumen)}</p>` : `<div class="muted" style="margin:6px 0">${busy ? 'La IA está leyendo Zendesk y Slack…' : 'Aún no hay análisis. Se hace solo; también puedes pulsar «Analizar» en el panel derecho.'}</div>`}
     ${g.length ? `<div class="gapbox"><b>Falta o requiere atención:</b><ul class="clean">${g.map(x => `<li>${esc(x)}</li>`).join('')}</ul></div>` : (a ? '<div class="muted sm">No se detectan faltantes.</div>' : '')}
     ${log.length ? `<div class="muted sm" style="margin-top:8px">Últimos cambios: ${log.map(l => `<b>${esc(l.by === 'IA' ? 'IA' : prettyUser(l.by))}</b> ${esc(l.txt)} (${ago(l.at)})`).join(' · ')}</div>` : ''}</div>`;
+}
+
+/* ---------- Por subsanar: lo que se debe, de quién y con ayuda de la IA ---------- */
+UI.owed = { org: '', who: '', kind: '' };
+const OWED_K = { venc: 'Vencido', resp: 'Responder', dato: 'Falta dato', ia: 'Detectado por IA', paso: 'Actividad' };
+const OWED_ORD = { venc: 0, resp: 1, dato: 2, ia: 3, paso: 4 };
+function owedRows() {
+  const rows = [], now = new Date();
+  for (const t of Object.values(S.tickets)) {
+    if (t.zdClosed) continue;
+    const ag = agentName(t) || 'Sin asignar', os = openSteps(t), ct = contactName(t) || 'Cliente';
+    const add = (kind, what, who, dep, due, sid) => rows.push({ key: t.id + '|' + kind + '|' + hid(norm(what)), t, kind, what, who: who || ag, dep: dep || 'inference', due: due || '', sid });
+    if (t.type !== 'dt' && !deliveryOf(t)) add('dato', 'Falta la fecha de entrega', S.settings.dateOwner || ag);
+    if (C.channels.length && !t.slackId) add('dato', 'Falta vincular el canal de Slack', ag);
+    if (!os.length) add('dato', 'No hay siguiente paso registrado', ag);
+    const nw = os.filter(s => !s.who).length; if (nw) add('dato', `${nw} actividad(es) sin encargado`, ag);
+    if (t.type !== 'dt' && zdHours(t) === null && !(t.rep && t.rep.hEst)) add('dato', 'Faltan las horas estimadas', ag);
+    if (clientWaiting(t)) add('resp', 'El cliente espera respuesta de Inference', ag);
+    const seen = new Set(rows.filter(r => r.t === t).map(r => norm(r.what)));
+    aiGapsFull(t).forEach(g => { if (seen.has(norm(g.texto))) return; seen.add(norm(g.texto)); const cli = /cliente/i.test(g.responsable || '') || (g.responsable && g.responsable === ct); add('ia', g.texto, cli ? (g.responsable && !/^cliente$/i.test(g.responsable) ? g.responsable : ct) : g.responsable, cli ? 'cliente' : 'inference'); });
+    os.forEach(s => { const late = s.due && parseDue(s.due) < now, cli = s.owner === 'cliente'; add(late ? 'venc' : 'paso', s.text, s.who || (cli ? ct : ag), s.owner, s.due, s.id); });
+  }
+  return rows.sort((a, b) => OWED_ORD[a.kind] - OWED_ORD[b.kind] || (a.t.client || '').localeCompare(b.t.client || '') || a.t.id - b.t.id);
+}
+const owedFiltered = rows => rows.filter(r => (!UI.owed.org || (r.t.client || '—') === UI.owed.org) && (!UI.owed.who || r.who === UI.owed.who) && (!UI.owed.kind || r.kind === UI.owed.kind));
+const owedAdv = r => (C.owedAI || {})[r.key];
+function owedView() {
+  const all = owedRows(), rows = owedFiltered(all), ed = canEdit();
+  const orgs = [...new Set(all.map(r => r.t.client || '—'))].sort(), whos = [...new Set(all.map(r => r.who))].sort();
+  const cnt = k => all.filter(r => r.kind === k).length;
+  const chip = (v, l, n) => `<button class="chip ${UI.owed.kind === v ? 'on' : ''}" data-act="owedF" data-k="kind" data-v="${v}">${l}${n !== undefined ? ` <b>${n}</b>` : ''}</button>`;
+  const sel = (k, arr, label) => `<select data-ch="owedSel" data-k="${k}" style="max-width:240px"><option value="">${label}</option>${arr.map(x => `<option value="${esc(x)}" ${UI.owed[k] === x ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select>`;
+  const open = Object.values(S.tickets).filter(t => !t.zdClosed), stale = open.filter(needsAI).length;
+  const body = rows.length ? `<table class="tb"><thead><tr><th></th><th>Ticket</th><th>Organización</th><th>Responsable de subsanar</th><th>Qué se debe</th><th>Vence</th><th>Ayuda de la IA</th></tr></thead><tbody>${rows.map(r => {
+    const a = owedAdv(r), t = r.t;
+    return `<tr><td>${r.sid ? `<input type="checkbox" data-ch="stepDone" data-id="${t.id}" data-sid="${r.sid}" title="Marcar como hecho">` : ''}</td>
+      <td class="click" data-act="openTicket" data-id="${t.id}">${tagT(t.type)} <b>#${t.id}</b><div class="sm">${esc(trunc(t.subject, 60))}</div></td>
+      <td>${esc(t.client || '—')}</td>
+      <td><b>${esc(r.who)}</b><div>${ownP(r.dep)}</div></td>
+      <td><span class="gap ${r.kind === 'venc' || r.kind === 'resp' ? 'hot' : ''}">${OWED_K[r.kind]}</span> ${esc(r.what)}</td>
+      <td class="nw">${r.due ? `<span class="${r.kind === 'venc' ? 'late' : ''}">${esc(fmtDue(r.due))}</span>` : '<span class="muted">—</span>'}</td>
+      <td class="sm">${a ? `${esc(a.accion)}${a.resp && a.resp !== r.who ? `<div class="muted">Sugiere: ${esc(a.resp)}</div>` : ''}` : '<span class="muted">—</span>'}</td></tr>`;
+  }).join('')}</tbody></table>` : `<div class="empty">${all.length ? 'Nada con estos filtros.' : 'Nada pendiente por subsanar. 🎉'}</div>`;
+  return `<div class="page"><h1>Por subsanar</h1><p class="lead">Lo que se debe en cada ticket, quién tiene que resolverlo y qué falta. Se alimenta solo de los datos del ticket, las actividades abiertas y el análisis automático de la IA.</p>
+    <div class="fbar" style="margin-bottom:10px">${chip('', 'Todo', all.length)}${chip('venc', 'Vencido', cnt('venc'))}${chip('resp', 'Responder', cnt('resp'))}${chip('dato', 'Faltan datos', cnt('dato'))}${chip('ia', 'Detectado por IA', cnt('ia'))}${chip('paso', 'Actividades', cnt('paso'))}</div>
+    <div class="row wrap" style="margin-bottom:14px">${sel('org', orgs, 'Todas las organizaciones')}${sel('who', whos, 'Todos los responsables')}
+      <button class="btn pri" data-act="owedAI" ${UI.busy.owed || !ed || !rows.length ? 'disabled' : ''}>${ic('spark', 14)} ${UI.busy.owed ? 'Pensando…' : 'IA: cómo subsanarlo'}</button>
+      <button class="btn" data-act="owedBatch" ${AUTO.batch || !ed ? 'disabled' : ''} title="Lee Zendesk y Slack de los tickets con novedades para detectar lo que falta">${ic('refresh', 14)} ${AUTO.batch ? `Analizando ${AUTO.batch.n}/${AUTO.batch.of}…` : `Actualizar análisis${stale ? ` (${stale})` : ''}`}</button>
+      <button class="btn" data-act="owedCopy">${ic('copy', 14)} Copiar lista</button><button class="btn" data-act="owedCopyBy">${ic('copy', 14)} Copiar por responsable</button></div>
+    ${body}</div>`;
+}
+const owedLine = r => `#${r.t.id} · ${r.t.client || '-'} · ${r.t.subject} — ${OWED_K[r.kind]}: ${r.what}${r.due ? ' (vence ' + fmtDue(r.due) + ')' : ''}`;
+function owedText(by) {
+  const rows = owedFiltered(owedRows());
+  if (!by) return rows.map(r => `${r.who} | ${owedLine(r)}`).join('\n');
+  const g = {}; rows.forEach(r => (g[r.who] = g[r.who] || []).push(r));
+  return Object.keys(g).sort().map(w => `${w} (${g[w].length})\n` + g[w].map(r => '  - ' + owedLine(r)).join('\n')).join('\n\n');
+}
+async function owedAdvice() {
+  const rows = owedFiltered(owedRows()).slice(0, 40); if (!rows.length) return;
+  UI.busy.owed = true; render();
+  try {
+    const line = (r, i) => `${i + 1} | #${r.t.id} ${r.t.type.toUpperCase()} | ${r.t.client || '-'} | estado: ${statusOf(r.t)} | contexto: ${trunc((r.t.ai && r.t.ai.data && r.t.ai.data.resumen) || r.t.subject, 140)} | tipo: ${OWED_K[r.kind]} | responsable actual: ${r.who} (${OWN[r.dep] || r.dep}) | ${r.what}${r.due ? ' | vence ' + r.due : ''}`;
+    const team = [...new Set(Object.values(S.tickets).flatMap(teamNames))].slice(0, 20).join(', ');
+    const txt = await ai('Eres el asistente de un Project Manager de Inference Labs9 (implementaciones y evolutivos sobre Zendesk, Slack y Five9). Para cada punto adeudado indica en UNA frase, en español y accionable, qué hacer exactamente para subsanarlo (a quién pedir qué, qué registrar, qué responder). Si el responsable actual no es el adecuado propón otro del EQUIPO o «Cliente». No inventes datos. Devuelve solo JSON: {"items":[{"n":1,"accion":"...","responsable":"nombre o vacío si el actual es correcto"}]}', `Hoy es ${todayStr()}.\nEQUIPO: ${team || '(desconocido)'}\n\n` + rows.map(line).join('\n'), { json: true });
+    const d = parseJSON(txt); C.owedAI = C.owedAI || {};
+    (d.items || []).forEach(x => { const r = rows[(parseInt(x.n, 10) || 0) - 1]; if (r && x.accion) C.owedAI[r.key] = { accion: String(x.accion).slice(0, 300), resp: String(x.responsable || '').slice(0, 60), at: Date.now() }; });
+    save(); toast('La IA sugirió cómo subsanar ' + (d.items || []).length + ' punto(s)');
+  } catch (e) { toast('IA: ' + e.message, 'err'); }
+  UI.busy.owed = false; render();
 }
 
 /* =====================================================================
@@ -1941,6 +2036,11 @@ const ACT = {
   aiRemind: d => { const t = T_(d.id), f = t.ai.data.fechas[+d.i]; if (!validDate(f.fecha)) return toast('La IA no dio una fecha válida', 'err'); t.reminders.push({ id: uid(), text: f.texto, due: `${f.fecha}T${f.hora && /^\d{2}:\d{2}$/.test(f.hora) ? f.hora : '09:00'}`, done: false, source: 'IA' }); save(); render(); toast('Recordatorio creado'); },
   aiToTpl: d => { const t = T_(d.id); UI.tpl[d.id] = { id: (S.templates[0] || {}).id, text: t.ai.data.respuestas[+d.i].texto, edited: true }; UI.tab[d.id] = 'tpl'; render(); },
   /* pendientes y daily */
+  owedF: d => { UI.owed[d.k] = d.v; render(); },
+  owedAI: () => owedAdvice(),
+  owedBatch: () => aiBatch(Object.values(S.tickets).filter(t => !t.zdClosed)),
+  owedCopy: () => copy(owedText(false)),
+  owedCopyBy: () => copy(owedText(true)),
   pendF: d => { UI.pend[d.k] = d.v; render(); },
   dailyCopy: () => copy(dailyRows().map(dailyLine).join('\n')),
   dailyCopyHTML: async () => {
@@ -1965,6 +2065,15 @@ const ACT = {
   archDl: d => { const a = S.archive[+d.i]; download(`ticket-${a.id}.md`, a.summary, 'text/markdown'); },
   archDel: d => { if (confirm('¿Eliminar este resumen del archivo?')) { S.archive.splice(+d.i, 1); save(); render(); } },
   /* ajustes */
+  aiModels: async () => {
+    try { C.aiModels = await api('/ai/models'); save(); render(); toast(`Modelos: ${C.aiModels.gemini.length} Gemini · ${C.aiModels.groq.length} Groq`); }
+    catch (e) { toast(e.message, 'err'); }
+  },
+  aiTest: async () => {
+    toast('Probando IA…');
+    try { const t0 = Date.now(); await ai('Responde solo {"ok":true}', 'ping', { json: true, tries: 1 }); const l = C.aiLast || {}; render(); toast(`IA OK: ${l.provider} · ${l.model || ''} (${((Date.now() - t0) / 1000).toFixed(1)}s)`); }
+    catch (e) { toast('IA: ' + e.message, 'err'); }
+  },
   testConn: async () => { await loadHealth(); render(); C.health ? toast('Conexión correcta') : toast(UI.err || 'No se pudo conectar', 'err'); },
   askNotif: async () => { if ('Notification' in window) await Notification.requestPermission(); render(); },
   exportData: () => { const o = { settings: { ...S.settings } }; KV_KEYS.forEach(k => o[k] = S[k]); download(`pm-hub-${isoDay(new Date())}.json`, JSON.stringify(o, null, 1), 'application/json'); },
@@ -2030,6 +2139,9 @@ const ACT = {
 };
 
 const CH = {
+  owedSel: el => { UI.owed[el.dataset.k] = el.value; render(); },
+  aiProv: el => { S.settings.aiProvider = el.value; save(); render(); if (el.value !== 'auto' && !C.aiModels && canEdit()) ACT.aiModels(); },
+  aiModel: el => { S.settings[el.dataset.k] = el.value; save(); render(); },
   userRole: async el => {
     try { await api('/users', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ user: el.dataset.u, role: el.value }) }); await loadUsers(); toast('Rol actualizado'); }
     catch (e) { toast(e.message, 'err'); await loadUsers(); }
