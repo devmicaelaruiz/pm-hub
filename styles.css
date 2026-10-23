@@ -291,3 +291,6 @@ ul.clean{margin:4px 0 0;padding-left:18px}ul.clean li{margin:2px 0}
 .tb .nw{white-space:nowrap}
 .tb td.click{cursor:pointer}
 .late{color:var(--red);font-weight:600}
+
+.aipick{display:inline-flex;align-items:center;gap:4px;margin-right:12px;color:var(--muted)}
+.aipick select{max-width:190px;padding:3px 6px;font-size:12.5px;height:auto}
