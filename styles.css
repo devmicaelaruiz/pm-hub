@@ -285,3 +285,9 @@ ul.clean{margin:4px 0 0;padding-left:18px}ul.clean li{margin:2px 0}
 @media print{.aistrip,.gapdet,.ro-banner{display:none!important}}
 
 .tk-body table.tb .mini{min-width:110px}.tk-body table.tb td{vertical-align:top}
+
+/* v1.8 Por subsanar */
+.gap.hot{background:var(--red-bg,#fde8e8);color:var(--red,#b42318)}
+.tb .nw{white-space:nowrap}
+.tb td.click{cursor:pointer}
+.late{color:var(--red);font-weight:600}
