@@ -4,7 +4,7 @@
    Web estática (GitHub Pages) + proxy Cloudflare Worker (Zendesk, Slack, IA)
    ===================================================================== */
 
-const VERSION = 'v1.8 · Por subsanar';
+const VERSION = 'v1.9 · selector rápido de modelo de IA';
 
 /* ---------- utilidades ---------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -165,6 +165,7 @@ async function ai(system, user, { json = true, tries = 3 } = {}) {
       C.aiLast = { provider: r.provider, model: r.model, at: Date.now() };
       return r.text;
     } catch (e) {
+      if (/high demand|overloaded|saturad|unavailable/i.test(e.message || '') && !/Elige otro modelo/.test(e.message)) e.message += ' → Elige otro modelo en el selector «IA» de la barra superior (o en Ajustes) y vuelve a intentar.';
       if (e.status === 429 && i < tries - 1) { const w = Math.min(60, e.retry || 20); toast(`IA gratuita al límite, reintentando en ${w}s…`); await sleep(w * 1000); continue; }
       throw e;
     }
@@ -931,7 +932,7 @@ function tabsHTML() {
     const t = S.tickets[id]; if (!t) return '';
     return `<div class="tab ${UI.route.v === 'ticket' && UI.route.id === id ? 'on' : ''}" data-act="openTicket" data-id="${id}"><span class="t">${esc(t.subject)} #${id}</span><span class="x" data-act="closeTab" data-id="${id}">${ic('x', 12)}</span></div>`;
   }).join('');
-  return `<div class="tabs">${home}${tks}<div class="grow"></div><div class="sync"><span class="me" title="${esc(SH.err ? 'Sin sincronizar con el equipo: ' + SH.err : SH.last ? 'Sincronizado con el equipo ' + ago(SH.last) : 'Sesión')}">${esc(prettyUser(meName()))} · ${ROLE_LABEL[role()]}${S.settings.syncKV && C.health && C.health.kv !== false ? `<i class="sdot ${SH.err ? 'bad' : ''}"></i>` : ''}</span><span id="syncMsg">${syncHTML()}</span><button data-act="refresh" title="Actualizar ahora">${ic('refresh', 14)}<span>Actualizar</span></button></div></div>`;
+  return `<div class="tabs">${home}${tks}<div class="grow"></div><div class="sync">${aiPickerHTML()}<span class="me" title="${esc(SH.err ? 'Sin sincronizar con el equipo: ' + SH.err : SH.last ? 'Sincronizado con el equipo ' + ago(SH.last) : 'Sesión')}">${esc(prettyUser(meName()))} · ${ROLE_LABEL[role()]}${S.settings.syncKV && C.health && C.health.kv !== false ? `<i class="sdot ${SH.err ? 'bad' : ''}"></i>` : ''}</span><span id="syncMsg">${syncHTML()}</span><button data-act="refresh" title="Actualizar ahora">${ic('refresh', 14)}<span>Actualizar</span></button></div></div>`;
 }
 function bellHTML() {
   const items = S.notifications.slice(0, 40).map(a => `<div class="al ${a.read ? '' : 'un'}" data-act="alertGo" data-id="${a.tid}" data-aid="${a.id}"><div>${ic(a.kind === 'vence' ? 'clock' : a.kind === 'avance' ? 'refresh' : a.kind === 'cal' ? 'cal' : 'bell', 16)}</div><div><div>${esc(a.text)}</div><div class="muted sm">${ago(a.ts)}</div></div></div>`).join('');
@@ -1915,6 +1916,25 @@ async function owedAdvice() {
   UI.busy.owed = false; render();
 }
 
+/* ---------- selector rápido de modelo (barra superior) ---------- */
+async function loadAiModels(quiet) {
+  if (!configured() || !canEdit() || (C.health && !C.health.ai)) return;
+  try { C.aiModels = await api('/ai/models'); save(); render(); if (!quiet) toast(`Modelos: ${C.aiModels.gemini.length} Gemini · ${C.aiModels.groq.length} Groq`); }
+  catch (e) { if (!quiet) toast(e.status === 404 ? 'Tu Worker es antiguo: sube el worker.js nuevo para listar modelos.' : e.message, 'err'); }
+}
+function aiPickerHTML() {
+  if (!configured() || !canEdit() || (C.health && !C.health.ai)) return '';
+  const s = S.settings, M = C.aiModels, pv = s.aiProvider || 'auto';
+  const cur = pv === 'auto' ? 'auto' : pv + '|' + (s[pv + 'Model'] || '');
+  const o = (v, l) => `<option value="${esc(v)}" ${v === cur ? 'selected' : ''}>${esc(l)}</option>`;
+  let opts = o('auto', 'Automático');
+  const has = new Set(['auto']);
+  const add = (p, arr, nm) => { if (!arr || !arr.length) return; opts += `<optgroup label="${nm}">` + o(p + '|', nm + ' · automático') + arr.map(m => o(p + '|' + m, m)).join('') + '</optgroup>'; has.add(p + '|'); arr.forEach(m => has.add(p + '|' + m)); };
+  if (M) { add('gemini', M.gemini, 'Gemini'); add('groq', M.groq, 'Groq'); }
+  if (!has.has(cur)) opts += o(cur, cur.replace('|', ' · ') || cur);
+  return `<label class="aipick" title="Modelo de IA (solo gratuitos). Si uno está saturado, elige otro.">${ic('spark', 13)}<select data-ch="aiQuick">${opts}</select>${M ? '' : `<button class="btn sm" data-act="aiModels" title="Cargar modelos disponibles">${ic('refresh', 12)}</button>`}</label>`;
+}
+
 /* =====================================================================
    ACCIONES
    ===================================================================== */
@@ -1948,7 +1968,7 @@ const ACT = {
     try { await login(url, user, pass, rem); }
     catch (e) { UI.loginMsg = e.message; return render(); }
     UI.loginMsg = ''; render(); startTimers();
-    await loadHealth(); await loadMe(); await syncShared(); await syncAll();
+    await loadHealth(); loadAiModels(true); await loadMe(); await syncShared(); await syncAll();
   },
   logout: () => { if (confirm('¿Cerrar sesión? Se borra de este navegador la caché de mensajes; tus pendientes y notas se conservan.')) logout('Sesión cerrada.'); },
   nav: d => go(d.v, d.id),
@@ -2065,10 +2085,7 @@ const ACT = {
   archDl: d => { const a = S.archive[+d.i]; download(`ticket-${a.id}.md`, a.summary, 'text/markdown'); },
   archDel: d => { if (confirm('¿Eliminar este resumen del archivo?')) { S.archive.splice(+d.i, 1); save(); render(); } },
   /* ajustes */
-  aiModels: async () => {
-    try { C.aiModels = await api('/ai/models'); save(); render(); toast(`Modelos: ${C.aiModels.gemini.length} Gemini · ${C.aiModels.groq.length} Groq`); }
-    catch (e) { toast(e.message, 'err'); }
-  },
+  aiModels: () => loadAiModels(false),
   aiTest: async () => {
     toast('Probando IA…');
     try { const t0 = Date.now(); await ai('Responde solo {"ok":true}', 'ping', { json: true, tries: 1 }); const l = C.aiLast || {}; render(); toast(`IA OK: ${l.provider} · ${l.model || ''} (${((Date.now() - t0) / 1000).toFixed(1)}s)`); }
@@ -2139,6 +2156,7 @@ const ACT = {
 };
 
 const CH = {
+  aiQuick: el => { const [p, m] = el.value.split('|'); S.settings.aiProvider = p; if (p !== 'auto') S.settings[p + 'Model'] = m || ''; save(); render(); toast(p === 'auto' ? 'IA: automático' : `IA: ${p} · ${m || 'automático'}`); },
   owedSel: el => { UI.owed[el.dataset.k] = el.value; render(); },
   aiProv: el => { S.settings.aiProvider = el.value; save(); render(); if (el.value !== 'auto' && !C.aiModels && canEdit()) ACT.aiModels(); },
   aiModel: el => { S.settings[el.dataset.k] = el.value; save(); render(); },
@@ -2212,6 +2230,6 @@ window.addEventListener('beforeunload', e => { if (REC.on) { e.preventDefault();
 /* ---------- arranque ---------- */
 (async function init() {
   render(); startTimers();
-  if (configured()) { await loadHealth(); await loadMe(); await syncShared(); await syncAll(); }
+  if (configured()) { await loadHealth(); loadAiModels(true); await loadMe(); await syncShared(); await syncAll(); }
   tick();
 })();
