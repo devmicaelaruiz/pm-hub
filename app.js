@@ -1278,6 +1278,7 @@ function settingsView() {
       ${inp('dateOwner', 'Quién envía las fechas de entrega', 'text', 'Se usa en el Calendario y en los avisos cuando falta una fecha.')}
       ${chk('autoAI', 'IA automática en segundo plano (gasta tokens aunque no la pidas). Recomendado: apagada y usar el botón «Actualizar con IA…»')}<div style="width:220px">${inp('aiPerHour', 'Máx. análisis automáticos por hora', 'number', 'Solo cuenta si dejas la IA automática encendida.')}</div>
       ${chk('purgeClosed', 'Mostrar solo tickets abiertos: quitar de la plataforma los que ya no están abiertos en Zendesk (si tienen notas o reuniones tuyas, se guarda una ficha en el archivo)')}
+      ${(() => { const n = Object.values(S.tickets).filter(t => !zdOpen(t)).length; return `<div class="row" style="margin:4px 0 10px"><button class="btn sm" data-act="purgeNow" ${n ? '' : 'disabled'}>${ic('trash', 13)} Limpiar ahora los cerrados (${n})</button><span class="muted sm">Quita ya mismo de la plataforma los tickets cerrados en Zendesk.</span></div>`; })()}
       ${chk('autoClose', 'Cerrar y archivar solos los tickets que ya terminaron: Zendesk resuelto/cerrado y canal de Slack archivado (sin IA, no gasta tokens)')}${chk('autoCloseSummary', 'Al cerrar solo, generar también el resumen final (sin IA). Si lo desmarcas, solo archiva')}<div style="width:220px">${inp('autoCloseMin', 'Esperar antes de archivar (minutos)', 'number', '0 = al instante. Da margen por si reabren el ticket.')}</div>
       ${inp('areas', 'Áreas del equipo (separadas por coma)', 'text', 'Aparecen al asignar área a hitos, entregables y tareas.')}${inp('provider', 'Nombre del proveedor (para el Status)', 'text', 'Sale en el encabezado del reporte de Status.')}
       <div class="muted sm" style="margin-top:10px">Formularios detectados: ${C.forms.length ? C.forms.map(f => `<span class="ztag">${esc(f.name)}</span>`).join(' ') : '—'}</div></div>
@@ -2309,6 +2310,7 @@ const ACT = {
   delDash: d => { const x = findDash(d.id); if (confirm(`¿Eliminar el dashboard «${x.name}»?`)) { S.folders.forEach(f => f.dashboards = f.dashboards.filter(y => y.id !== d.id)); if (UI.route.id === d.id) UI.route.id = 'all'; save(); render(); } },
   toggleFolder: d => { const f = S.folders.find(x => x.id === d.id); f.open = !f.open; save(); render(); },
   selectDash: d => { UI.route = { v: 'dash', id: d.id }; render(); },
+  purgeNow: () => { S.settings.purgeClosed = true; const ids = Object.values(S.tickets).filter(t => !zdOpen(t)).map(t => t.id); ids.forEach(purgeTicket); save(); render(); toast(`Se quitaron ${ids.length} ticket(s) cerrados`); },
   dfClear: () => { const dd = UI.route.id === 'all' ? null : findDash(UI.route.id), f = dd ? dd.filters : UI.fAll; for (const k of Object.keys(f)) f[k] = Array.isArray(f[k]) ? [] : typeof f[k] === 'boolean' ? false : ''; save(); render(); },
   dfType: d => { const dd = UI.route.id === 'all' ? null : findDash(UI.route.id), f = dd ? dd.filters : UI.fAll; f.types = f.types || []; f.types = f.types.includes(d.t) ? f.types.filter(x => x !== d.t) : [...f.types, d.t]; save(); render(); },
   /* ticket */
