@@ -4,7 +4,7 @@
    Web estática (GitHub Pages) + proxy Cloudflare Worker (Zendesk, Slack, IA)
    ===================================================================== */
 
-const VERSION = 'v1.9 · selector rápido de modelo de IA';
+const VERSION = 'v2.0 · accesos por cliente, IA bajo demanda, responsable técnico y cierre automático';
 
 /* ---------- utilidades ---------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -96,7 +96,7 @@ function defaults() {
       workerUrl: '', pollSec: 60, slackPollSec: 120,
       keywords: 'evolutivo, deuda técnica, proyecto', internalDomains: 'inferencelabs9.com',
       myName: '', dailyTime: '17:30', staleDays: 2, leadMin: 60, replyHours: 4,
-      notif: true, includeSolved: false, syncKV: true, autoAI: true, aiPerHour: 14, aiProvider: 'auto', geminiModel: '', groqModel: '', autoDates: true, dateOwner: 'Giancarlo Guzmán',
+      notif: true, includeSolved: false, syncKV: true, autoAI: false, autoClose: true, autoCloseMin: 10, aiPerHour: 14, aiProvider: 'auto', geminiModel: '', groqModel: '', autoDates: true, dateOwner: 'Giancarlo Guzmán',
       areas: 'Tecnología, Operaciones, QA, Proyectos, Comercial, Cliente', provider: 'Inference Labs9',
     },
     folders: [{ id: 'f1', name: 'Mis dashboards', open: true, dashboards: [{ id: 'd1', name: 'Pendientes de respuesta', filters: { types: [], q: '', status: '', client: '', owner: '', slack: '', attention: true } }] }],
@@ -105,6 +105,8 @@ function defaults() {
 }
 const loadJSON = (k, def) => { try { const v = JSON.parse(localStorage.getItem(k)); return v || def; } catch { return def; } };
 let S = (() => { const d = defaults(), s = loadJSON(LS, null); const r = s ? { ...d, ...s, settings: { ...d.settings, ...(s.settings || {}) } } : d; delete r.settings.appKey; return r; })();
+/* v2.0: la IA pasa a ser bajo demanda y el cierre automático se enciende (una sola vez por navegador) */
+if ((S.settings.settingsVer || 0) < 2) { S.settings.autoAI = false; S.settings.autoClose = true; S.settings.autoCloseMin = 10; S.settings.settingsVer = 2; }
 let C = { forms: [], fields: [], users: {}, comments: {}, slack: {}, channels: [], workspaceUrl: '', base: '', health: null, ...loadJSON(LC, {}) };
 
 let saveT = null;
@@ -131,7 +133,7 @@ async function login(url, user, password, remember) {
   catch { throw new Error('No se pudo conectar con el Worker. Revisa la URL.'); }
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || ('Error ' + r.status));
-  localStorage.setItem(SESS, JSON.stringify({ token: j.token, exp: j.exp, user: j.user, role: j.role || 'editor' }));
+  localStorage.setItem(SESS, JSON.stringify({ token: j.token, exp: j.exp, user: j.user, role: j.role || 'editor', clients: j.clients || '*', ai: j.ai !== false }));
   S.settings.workerUrl = url; save();
 }
 function logout(msg) {
@@ -157,12 +159,14 @@ async function api(path, opts = {}) {
   return j;
 }
 async function ai(system, user, { json = true, tries = 3 } = {}) {
+  if ((session() || {}).ai === false) throw new Error('Tu usuario no tiene permiso para usar la IA. Pídeselo al administrador.');
   for (let i = 0; i < tries; i++) {
     try {
       const st = S.settings, pv = st.aiProvider || 'auto';
       const body = { system, user, json, provider: pv, model: pv === 'gemini' ? st.geminiModel : pv === 'groq' ? st.groqModel : '' };
       const r = await api('/ai', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
       C.aiLast = { provider: r.provider, model: r.model, at: Date.now() };
+      { const dk = isoDay(new Date()); C.aiUse = C.aiUse && C.aiUse.day === dk ? C.aiUse : { day: dk, n: 0 }; C.aiUse.n++; }
       return r.text;
     } catch (e) {
       if (/high demand|overloaded|saturad|unavailable/i.test(e.message || '') && !/Elige otro modelo/.test(e.message)) e.message += ' → Elige otro modelo en el selector «IA» de la barra superior (o en Ajustes) y vuelve a intentar.';
@@ -413,6 +417,7 @@ function dueAlerts(t, text, due, key, label) {
   else if (diff <= 1440) alertOnce(key + ':d1', t.id, 'vence', `${tag} · ${label} vence en menos de 24 h (${fmtDue(due)}): ${trunc(text, 80)}`);
 }
 function tick() {
+  autoCloseCheck();
   const now = new Date();
   for (const t of Object.values(S.tickets)) {
     if (t.readyToClose) alertOnce(`close:${t.id}`, t.id, 'cierre', `#${t.id} terminó (${t.zdClosed ? 'Zendesk cerrado' : 'canal de Slack archivado'}). Genera el resumen final y archívalo.`);
@@ -540,6 +545,7 @@ async function refreshSlack(t) {
   const d = await api('/slack/history?channel=' + encodeURIComponent(t.slackId));
   const cobj = C.channels.find(c => c.id === t.slackId);
   t.slackArchived = !!(cobj && cobj.archived);
+  t.slackArchivedReal = !!(cobj && cobj.archived);   // archivado de verdad (no solo «no encontrado»): lo usa el cierre automático
   if (d.missing) { t.slackArchived = true; t.readyToClose = true; return; }
   const users = d.users || {};
   const msgs = d.messages.filter(m => !/channel_join|channel_leave/.test(m.subtype)).map(m => ({
@@ -552,6 +558,7 @@ async function refreshSlack(t) {
     alertOnce(`slack:${t.id}:${newest}`, t.id, 'avance', `Slack #${t.id} · ${fresh.length} mensaje(s) nuevo(s). ${l.user}: ${trunc(l.text, 90)}`);
   }
   t.lastSlackTs = newest; C.slack[t.id] = msgs.slice(-60);
+  autoTech(t);
   autoDates(t);
   if (t.slackArchived) t.readyToClose = true;
 }
@@ -690,28 +697,67 @@ function tplVars(t) {
 const renderTpl = (body, t) => { const v = tplVars(t); return body.replace(/\{\{(\w+)\}\}/g, (_, k) => v[k] ?? ''); };
 
 /* ---------- cierre y archivo ---------- */
-async function closeAndArchive(tid) {
+/* Resumen final armado con lo que ya hay (último análisis, pasos, reuniones, notas): no gasta IA */
+function buildFinalSummary(t, auto) {
+  const a = t.ai && t.ai.data, sm = sumOf(t).text, lp = lastPublic(t), tn = techOf(t).name, list = arr => arr.length ? arr.join('\n') : '-';
+  const hitos = ticketItems(t).filter(i => i.kind !== 'tarea').sort((x, y) => x.end.localeCompare(y.end)).map(i => `- ${i.title} (${fmtDue(i.end)})${i.done ? ' ✓' : ''}`);
+  const hechos = (t.steps || []).filter(x => x.done).map(x => `- ${x.text}${x.who ? ' — ' + x.who : ''}`);
+  const abiertos = openSteps(t).map(x => `- ${x.text} (${OWN[x.owner] || x.owner}${x.who ? ', ' + x.who : ''}${x.due ? ', vence ' + fmtDue(x.due) : ''})`);
+  const reun = (t.meetings || []).map(m => `- ${m.date} · ${m.title}${m.summary && m.summary.resumen ? ': ' + trunc(m.summary.resumen, 240) : ''}`);
+  const alertas = a && Array.isArray(a.alertas) ? a.alertas.map(x => '- ' + x) : [];
+  const fin = sm || (lp ? `Último mensaje público (${fmtTS(lp.at)}, ${lp.author}): ${trunc(lp.body, 420)}` : '(sin resumen: edítalo antes de guardar)');
+  return `# #${t.id} — ${t.subject}\nCliente: ${t.client || '-'} · Tipo: ${TYPES[t.type]} · Creado: ${(t.createdAt || '').slice(0, 10)} · Cerrado: ${isoDay(new Date())}${tn ? ' · Responsable técnico: ' + tn : ''}\n${auto ? `Cierre automático: Zendesk «${t.zdStatus}» y canal de Slack archivado${t.slackName ? ' (#' + t.slackName + ')' : ''}.\n` : ''}\n## Resumen final\n${fin}\n\n## Hitos y entregables\n${list(hitos)}\n\n## Actividades completadas\n${list(hechos)}\n\n## Pendientes residuales\n${list(abiertos)}\n\n## Reuniones\n${list(reun)}\n\n## Riesgos y aprendizajes (último análisis)\n${list(alertas)}\n\n## Notas\n${(t.notes || '').trim() || '-'}\n`;
+}
+function archiveTicket(tid, o = {}) {
   const t = S.tickets[tid]; if (!t) return;
-  UI.busy['close' + tid] = true; render();
-  let sum = '';
+  let text = o.text || buildFinalSummary(t, !!o.auto);
+  const stamp = o.auto ? `— Cierre automático (sin IA) · ${fmtTS(Date.now())}` : `— Firmado: ${prettyUser(meName())} · ${fmtTS(Date.now())}`;
+  if (!/^— (Firmado|Cierre automático)/m.test(text)) text = text.replace(/\s+$/, '') + '\n\n' + stamp + '\n';
+  S.archive.unshift({ id: tid, subject: t.subject, client: t.client, type: t.type, closedAt: new Date().toISOString(), summary: text, by: o.auto ? 'auto' : meName() });
+  (S.gone = S.gone || {})[tid] = Date.now();
+  S.log = (S.log || []).concat(mkLog(tid, o.auto ? 'Sistema' : meName(), o.auto ? 'cerró y archivó el ticket solo (Zendesk cerrado + canal de Slack archivado)' : 'archivó el ticket')).slice(-200);
+  delete S.tickets[tid]; delete C.comments[tid]; delete C.slack[tid];
+  UI.tabs = UI.tabs.filter(x => x !== tid); if (UI.route.v === 'ticket' && UI.route.id === tid) UI.route = { v: 'dash', id: 'all' };
+  if (o.auto) alertOnce('autoclose:' + tid, '', 'cierre', `#${tid} (${trunc(t.subject, 60)}) se cerró y archivó solo: Zendesk cerrado y canal de Slack archivado. El resumen está en «Archivo de cierres».`);
+  save();
+}
+/* Zendesk resuelto/cerrado + canal de Slack archivado  →  se archiva solo (sin IA), tras unos minutos de margen */
+function autoCloseCheck() {
+  if (!S.settings.autoClose || !configured() || !canEdit()) return;
+  const wait = Math.max(0, +S.settings.autoCloseMin || 0) * 60000, now = Date.now(), todo = [];
+  for (const t of Object.values(S.tickets)) {
+    const fin = ['solved', 'closed'].includes(t.zdStatus) && t.slackArchivedReal && !UI.busy['close' + t.id];
+    if (!fin) { if (t.closeSeen) delete t.closeSeen; continue; }
+    if (!t.closeSeen) t.closeSeen = now;
+    if (now - t.closeSeen >= wait) todo.push(t.id);
+  }
+  if (!todo.length) return;
+  todo.forEach(id => archiveTicket(id, { auto: true }));
+  softRender();
+}
+function closeAndArchive(tid) {
+  const t = S.tickets[tid]; if (!t) return;
+  openFinalModal(tid, buildFinalSummary(t, false));
+}
+function openFinalModal(tid, sum) {
+  openModal(`<h2>Resumen final · #${esc(tid)}</h2><p class="muted">Armado con lo que ya hay (análisis, pasos, reuniones y notas): no gasta IA. Edítalo si hace falta; al guardar queda firmado con tu nombre. Se archiva este resumen y se borran del navegador los pendientes, reuniones, notas y mensajes del ticket.</p><textarea id="sumText" style="min-height:320px">${esc(sum)}</textarea><div class="row sp" style="margin-top:12px"><button class="btn" data-act="closeModal">Cancelar</button><div class="row"><button class="btn" data-act="finalAI" data-id="${esc(tid)}" title="Gasta 1 llamada de IA">${ic('spark')} Redactar con IA</button><button class="btn" data-act="copyEl" data-el="sumText">${ic('copy')} Copiar</button><button class="btn pri" data-act="confirmArchive" data-id="${esc(tid)}">Firmar, archivar y borrar datos</button></div></div>`);
+}
+async function finalAI(tid) {
+  const t = S.tickets[tid]; if (!t) return;
+  if (!canAI()) return toast('Tu usuario no puede usar la IA', 'err');
+  UI.busy['close' + tid] = true; toast('Redactando el resumen con IA…');
   try {
     const user = `Hoy es ${todayStr()}. El ticket terminó. Genera el RESUMEN FINAL para archivo.\n\n${ctxTicket(t, 6000, 4000)}\n\nReuniones: ${(t.meetings || []).map(m => m.date + ': ' + ((m.summary && m.summary.resumen) || '')).join(' | ') || 'ninguna'}\n\nEsquema JSON: {"resumen_final":"qué se pidió, qué se hizo y cómo terminó (máx 8 líneas)","hitos":["..."],"pendientes_residuales":["lo que quedó abierto, si hubo"],"aprendizajes":["..."]}`;
     const d = parseJSON(await ai(SYS, user));
-    sum = `# #${t.id} — ${t.subject}\nCliente: ${t.client || '-'} · Tipo: ${TYPES[t.type]} · Creado: ${(t.createdAt || '').slice(0, 10)} · Cerrado: ${isoDay(new Date())}\n\n## Resumen final\n${d.resumen_final || ''}\n\n## Hitos\n${(d.hitos || []).map(x => '- ' + x).join('\n') || '-'}\n\n## Pendientes residuales\n${(d.pendientes_residuales || []).map(x => '- ' + x).join('\n') || '-'}\n\n## Aprendizajes\n${(d.aprendizajes || []).map(x => '- ' + x).join('\n') || '-'}\n`;
-  } catch (e) {
-    UI.busy['close' + tid] = false; render();
-    return toast('No se pudo generar el resumen: ' + e.message, 'err');
-  }
-  UI.busy['close' + tid] = false;
-  openModal(`<h2>Resumen final · #${esc(t.id)}</h2><p class="muted">Al guardar se archiva solo este resumen y se borran del navegador los pendientes, reuniones, notas y mensajes del ticket.</p><textarea id="sumText" style="min-height:300px">${esc(sum)}</textarea><div class="row sp" style="margin-top:12px"><button class="btn" data-act="closeModal">Cancelar</button><div class="row"><button class="btn" data-act="copyEl" data-el="sumText">${ic('copy')} Copiar</button><button class="btn pri" data-act="confirmArchive" data-id="${esc(tid)}">Guardar resumen y borrar datos</button></div></div>`);
+    const sum = `# #${t.id} — ${t.subject}\nCliente: ${t.client || '-'} · Tipo: ${TYPES[t.type]} · Creado: ${(t.createdAt || '').slice(0, 10)} · Cerrado: ${isoDay(new Date())}\n\n## Resumen final\n${d.resumen_final || ''}\n\n## Hitos\n${(d.hitos || []).map(x => '- ' + x).join('\n') || '-'}\n\n## Pendientes residuales\n${(d.pendientes_residuales || []).map(x => '- ' + x).join('\n') || '-'}\n\n## Aprendizajes\n${(d.aprendizajes || []).map(x => '- ' + x).join('\n') || '-'}\n`;
+    openFinalModal(tid, sum);
+  } catch (e) { toast('No se pudo generar el resumen con IA: ' + e.message, 'err'); }
+  finally { UI.busy['close' + tid] = false; }
 }
 function confirmArchive(tid) {
-  const t = S.tickets[tid]; const text = $('#sumText').value;
-  S.archive.unshift({ id: tid, subject: t.subject, client: t.client, type: t.type, closedAt: new Date().toISOString(), summary: text });
-  (S.gone = S.gone || {})[tid] = Date.now();
-  delete S.tickets[tid]; delete C.comments[tid]; delete C.slack[tid];
-  UI.tabs = UI.tabs.filter(x => x !== tid); UI.route = { v: 'dash', id: 'all' };
-  closeModal(); save(); render(); toast(`#${tid} archivado`);
+  const el = $('#sumText'); if (!el) return;
+  archiveTicket(tid, { text: el.value });
+  closeModal(); render(); toast(`#${tid} archivado`);
 }
 
 /* =====================================================================
@@ -836,8 +882,8 @@ function repDerived(t) {
   const ns = nextStep(t), a = t.ai && t.ai.data;
   return {
     area: zdFieldVal(t, /^producto/) || zdFieldVal(t, /^area del cliente/),
-    resp: (() => { const w = whoOf(t); return w.names.join(', ') + (w.dep ? (w.names.length ? ' · ' : '') + 'Depende: ' + w.dep : ''); })(),
-    sit: a && a.resumen ? trunc(a.resumen, 240) : '',
+    resp: (() => { const w = whoOf(t), tn = techOf(t).name, names = tn ? [tn, ...w.names.filter(n => norm(n) !== norm(tn))] : w.names; return names.join(', ') + (w.dep ? (names.length ? ' · ' : '') + 'Depende: ' + w.dep : ''); })(),
+    sit: sumOf(t).text ? trunc(sumOf(t).text, 240) : '',
     next: ns ? `${ns.text}${ns.due ? ` (${fmtDue(ns.due)})` : ''}` : (a && a.siguientes_pasos && a.siguientes_pasos[0] ? String(a.siguientes_pasos[0].texto || '') : ''),
   };
 }
@@ -932,7 +978,7 @@ function tabsHTML() {
     const t = S.tickets[id]; if (!t) return '';
     return `<div class="tab ${UI.route.v === 'ticket' && UI.route.id === id ? 'on' : ''}" data-act="openTicket" data-id="${id}"><span class="t">${esc(t.subject)} #${id}</span><span class="x" data-act="closeTab" data-id="${id}">${ic('x', 12)}</span></div>`;
   }).join('');
-  return `<div class="tabs">${home}${tks}<div class="grow"></div><div class="sync">${aiPickerHTML()}<span class="me" title="${esc(SH.err ? 'Sin sincronizar con el equipo: ' + SH.err : SH.last ? 'Sincronizado con el equipo ' + ago(SH.last) : 'Sesión')}">${esc(prettyUser(meName()))} · ${ROLE_LABEL[role()]}${S.settings.syncKV && C.health && C.health.kv !== false ? `<i class="sdot ${SH.err ? 'bad' : ''}"></i>` : ''}</span><span id="syncMsg">${syncHTML()}</span><button data-act="refresh" title="Actualizar ahora">${ic('refresh', 14)}<span>Actualizar</span></button></div></div>`;
+  return `<div class="tabs">${home}${tks}<div class="grow"></div><div class="sync">${aiPickerHTML()}<span class="me" title="${esc(SH.err ? 'Sin sincronizar con el equipo: ' + SH.err : SH.last ? 'Sincronizado con el equipo ' + ago(SH.last) : 'Sesión')}">${esc(prettyUser(meName()))} · ${ROLE_LABEL[role()]}${restricted() ? ' · ' + myClients().length + ' cliente(s)' : ''}${S.settings.syncKV && C.health && C.health.kv !== false ? `<i class="sdot ${SH.err ? 'bad' : ''}"></i>` : ''}</span><span id="syncMsg">${syncHTML()}</span><button data-act="refresh" title="Actualizar ahora">${ic('refresh', 14)}<span>Actualizar</span></button></div></div>`;
 }
 function bellHTML() {
   const items = S.notifications.slice(0, 40).map(a => `<div class="al ${a.read ? '' : 'un'}" data-act="alertGo" data-id="${a.tid}" data-aid="${a.id}"><div>${ic(a.kind === 'vence' ? 'clock' : a.kind === 'avance' ? 'refresh' : a.kind === 'cal' ? 'cal' : 'bell', 16)}</div><div><div>${esc(a.text)}</div><div class="muted sm">${ago(a.ts)}</div></div></div>`).join('');
@@ -941,7 +987,8 @@ function bellHTML() {
 function viewHTML() {
   if (!configured() && UI.route.v !== 'settings') return `<div class="page"><h1>Bienvenido</h1><p class="lead">Conecta primero el Worker (Zendesk, Slack e IA). Toma 10 minutos y es gratis.</p><button class="btn pri" data-act="nav" data-v="settings">Ir a Ajustes</button></div>`;
   const ro = canEdit() ? '' : `<div class="ro-banner">Modo solo lectura: puedes ver, filtrar y copiar, pero no editar ni usar la IA.</div>`;
-  return ro + viewBody();
+  const rs = restricted() ? `<div class="ro-banner info">Acceso limitado a: <b>${esc(myClients().join(', '))}</b>. Solo ves los tickets, canales y datos de esos clientes.</div>` : '';
+  return ro + rs + viewBody();
 }
 function viewBody() {
   switch (UI.route.v) {
@@ -986,6 +1033,7 @@ function filterTickets(f) {
     if (f.client && norm(t.client) !== norm(f.client)) return false;
     const ns = nextStep(t); if (f.owner && (!ns || ns.owner !== f.owner)) return false;
     if (f.slack === 'linked' && !t.slackId) return false; if (f.slack === 'unlinked' && t.slackId) return false;
+    if (f.tech && norm(techOf(t).name) !== norm(f.tech)) return false;
     if (f.q && !norm(`${t.id} ${t.subject} ${t.client}`).includes(norm(f.q))) return false;
     if (f.attention && !needsAttention(t)) return false;
     return true;
@@ -1015,8 +1063,9 @@ function propsHTML(t, ru, ag) {
   const zf = zdFields(t), dv = deliveryOf(t);
   return `<div class="fgrid"><label class="lb">Solicitante</label><div class="field ro">${esc(ru ? ru.name : '—')}<div class="muted sm">${esc(ru ? ru.email : '')}</div></div>
     <label class="lb">Agente asignado</label><div class="field ro">${esc(ag ? ag.name : '—')}</div>
+    <label class="lb">Responsable técnico</label><div class="field ro">${techCell(t)}</div>
     <label class="lb">Estado en Zendesk</label><div class="field ro">${stDot(t.zdStatus)}${esc(t.zdStatus)}</div>
-    <label class="lb">Estado interno</label><select data-ch="internal" data-id="${t.id}"><option value="">Automático (${esc(derivedStatus(t))})</option>${STATUSES.map(s => `<option ${t.internal === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
+    <label class="lb">Estado interno</label><select data-ch="internal" data-id="${t.id}"><option value="">Automático (${esc(derivedStatus(t))})</option>${STATUSES.map(s => `<option ${t.internal === s ? 'selected' : ''}>${s}</option>`).join('')}</select>${sigLine(t, 'estado')}
     <label class="lb">Tipo</label><div class="field ro">${tagT(t.type)} ${esc(t.formName)}</div>
     <label class="lb">Cliente</label><div class="field ro">${esc(t.client || '—')}</div>
     <label class="lb">Fecha de entrega</label><input type="date" data-ch="delivery" data-id="${t.id}" value="${esc(dv ? dv.date : '')}"><div class="muted sm" style="margin-top:3px">${dv ? (dv.src === 'zendesk' ? 'Desde Zendesk: ' + esc(dv.title) : 'Puesta a mano (solo en esta web)') : 'Sin fecha. La debe enviar ' + esc(S.settings.dateOwner) + (t.dateAsked ? ' · pedida ' + ago(t.dateAsked) : '')}</div>
@@ -1045,7 +1094,7 @@ function slackTab(t) {
 /* --- seguimiento --- */
 function segTab(t) {
   const steps = (t.steps || []).slice().sort((a, b) => (a.done - b.done) || (a.due ? (b.due ? a.due.localeCompare(b.due) : -1) : (b.due ? 1 : 0)));
-  const rows = steps.map(s => `<tr class="${s.done ? 'done' : ''}"><td><input type="checkbox" data-ch="stepDone" data-id="${t.id}" data-sid="${s.id}" ${s.done ? 'checked' : ''}></td><td style="white-space:nowrap">${s.type === 'pendiente' ? 'Pendiente' : 'Siguiente'}</td><td style="min-width:190px">${esc(s.text)}${s.by ? `<div class="muted sm">${s.by === 'IA' ? '✦ detectado por IA' : 'por ' + esc(prettyUser(s.by))}${s.doneBy === 'IA' ? ' · cerrado por IA' : ''}</div>` : ''}</td><td>${ownP(s.owner)}</td><td><select class="mini" data-ch="stepField" data-k="area" data-id="${t.id}" data-sid="${s.id}">${areaOpts(s.area)}</select></td><td><input type="text" class="mini" list="dl_who" data-ch="stepField" data-k="who" data-id="${t.id}" data-sid="${s.id}" value="${esc(s.who || '')}" placeholder="Encargado"></td><td class="num" ${!s.done && s.due && parseDue(s.due) < new Date() ? 'style="color:var(--red);font-weight:600"' : ''}>${fmtDue(s.due)}</td><td><button class="ibtn" data-act="delStep" data-id="${t.id}" data-sid="${s.id}">${ic('trash', 14)}</button></td></tr>`).join('');
+  const rows = steps.map(s => `<tr class="${s.done ? 'done' : ''}"><td><input type="checkbox" data-ch="stepDone" data-id="${t.id}" data-sid="${s.id}" ${s.done ? 'checked' : ''}></td><td style="white-space:nowrap">${s.type === 'pendiente' ? 'Pendiente' : 'Siguiente'}</td><td style="min-width:230px"><input type="text" class="mini" style="width:100%" data-ch="stepField" data-k="text" data-id="${t.id}" data-sid="${s.id}" value="${esc(s.text)}" title="Puedes corregir el texto a mano">${s.by ? `<div class="muted sm">${s.by === 'IA' ? (s.ok ? `✦ IA · validado por ${esc(prettyUser(s.ok))}` : '✦ detectado por IA ' + (canEdit() ? `<button class="btn sm" data-act="stepOk" data-id="${t.id}" data-sid="${s.id}" title="Dar por bueno este punto (queda con tu firma)">${ic('check', 11)} Validar</button>` : '')) : 'por ' + esc(prettyUser(s.by))}${s.doneBy === 'IA' ? ' · cerrado por IA' : ''}</div>` : ''}</td><td>${ownP(s.owner)}</td><td><select class="mini" data-ch="stepField" data-k="area" data-id="${t.id}" data-sid="${s.id}">${areaOpts(s.area)}</select></td><td><input type="text" class="mini" list="dl_who" data-ch="stepField" data-k="who" data-id="${t.id}" data-sid="${s.id}" value="${esc(s.who || '')}" placeholder="Encargado"></td><td class="num" ${!s.done && s.due && parseDue(s.due) < new Date() ? 'style="color:var(--red);font-weight:600"' : ''}>${!s.due || s.due.length <= 10 ? `<input type="date" class="mini" data-ch="stepField" data-k="due" data-id="${t.id}" data-sid="${s.id}" value="${esc(s.due || '')}">` : fmtDue(s.due)}</td><td><button class="ibtn" data-act="delStep" data-id="${t.id}" data-sid="${s.id}">${ic('trash', 14)}</button></td></tr>`).join('');
   const rem = (t.reminders || []).slice().sort((a, b) => (a.done - b.done) || String(a.due).localeCompare(String(b.due)));
   const rrows = rem.map(r => `<tr class="${r.done ? 'done' : ''}"><td><input type="checkbox" data-ch="remDone" data-id="${t.id}" data-rid="${r.id}" ${r.done ? 'checked' : ''}></td><td>${esc(r.text)}</td><td class="num" ${!r.done && parseDue(r.due) < new Date() ? 'style="color:var(--red);font-weight:600"' : ''}>${fmtDue(r.due)}</td><td class="muted sm">${esc(r.source || '')}</td><td><button class="ibtn" data-act="delRem" data-id="${t.id}" data-rid="${r.id}">${ic('trash', 14)}</button></td></tr>`).join('');
   const det = detectedFor(t);
@@ -1103,9 +1152,10 @@ function aiPanel(t) {
   const a = t.ai && t.ai.data, b = UI.busy['ai' + t.id];
   const items = (arr, kind) => (arr || []).map((x, i) => `<div class="aiitem"><div class="tx">${esc(x.texto)}<div>${x.responsable ? ownP(x.responsable) : ''} <span class="muted sm">${x.vence && x.vence !== 'null' ? 'vence ' + fmtDue(x.vence) : ''}</span></div></div><button class="btn sm" data-act="aiAdd" data-id="${t.id}" data-kind="${kind}" data-i="${i}" title="Agregar a Seguimiento">${ic('plus', 13)}</button></div>`).join('');
   return `<div class="row sp" style="margin-bottom:10px"><h3>${ic('spark', 16)} Asistente IA</h3><span class="muted sm">${t.ai ? ago(t.ai.ts) : ''}</span></div>
-    <button class="btn pri" style="width:100%;justify-content:center" data-act="analyze" data-id="${t.id}" ${b ? 'disabled' : ''}>${b ? '<span class="spin" style="display:inline-block">' + ic('refresh', 14) + '</span> Analizando…' : ic('spark', 14) + ' Analizar ticket (Zendesk + Slack)'}</button>
+    <button class="btn pri" style="width:100%;justify-content:center" data-act="analyze" data-id="${t.id}" ${b || !canAI() ? 'disabled' : ''}>${b ? '<span class="spin" style="display:inline-block">' + ic('refresh', 14) + '</span> Analizando…' : ic('spark', 14) + ' Analizar ticket (Zendesk + Slack)'}</button>
+    <button class="btn" style="width:100%;justify-content:center;margin-top:6px" data-act="techEdit" data-id="${t.id}">${ic('hash', 14)} Responsable técnico${techOf(t).name ? ': ' + esc(trunc(techOf(t).name, 22)) : ''}</button>
     <details style="margin:10px 0"><summary>Agregar contexto o instrucción</summary><textarea data-ch="extra" data-id="${t.id}" placeholder="Pega correos, notas de llamada, algo que no esté en Zendesk/Slack…" style="margin-top:8px">${esc(UI.extra[t.id] || '')}</textarea><input type="text" id="aiInstr" placeholder="Instrucción para las respuestas (ej: tono más firme)" style="margin-top:6px"><button class="btn sm" style="margin-top:6px" data-act="analyze" data-id="${t.id}" data-instr="1">Regenerar con instrucción</button></details>
-    ${a ? `<div class="aibox"><h4>En qué estamos</h4><p>${esc(a.resumen || '—')}</p>${a.ultimo_avance ? `<h4 style="margin-top:8px">Último avance</h4><p>${esc(a.ultimo_avance)}</p>` : ''}${a.estado ? `<div class="row" style="margin-top:8px"><span class="muted sm">Estado sugerido:</span><span class="pill p-inference">${esc(a.estado)}</span>${STATUSES.includes(a.estado) && statusOf(t) !== a.estado ? `<button class="btn sm" data-act="aiState" data-id="${t.id}">Aplicar</button>` : ''}</div>` : ''}</div>
+    ${a ? `<div class="aibox"><h4>En qué estamos</h4><p>${esc(sumOf(t).text || '—')}</p>${sumActions(t)}${a.ultimo_avance ? `<h4 style="margin-top:8px">Último avance</h4><p>${esc(a.ultimo_avance)}</p>` : ''}${a.estado ? `<div class="row" style="margin-top:8px"><span class="muted sm">Estado sugerido:</span><span class="pill p-inference">${esc(a.estado)}</span>${STATUSES.includes(a.estado) && statusOf(t) !== a.estado ? `<button class="btn sm" data-act="aiState" data-id="${t.id}">Aplicar</button>` : ''}</div>` : ''}</div>
       ${allGaps(t).length ? `<div class="aibox" style="border-color:#f3d28a;background:var(--amber-bg)"><h4 style="color:var(--amber)">Falta</h4><ul class="clean">${allGaps(t).map(x => `<li>${esc(x)}</li>`).join('')}</ul></div>` : ''}
       ${(a.alertas || []).length ? `<div class="aibox" style="border-color:#f1b9bf;background:var(--red-bg)"><h4 style="color:var(--red)">Atención</h4><ul class="clean">${a.alertas.map(x => `<li>${esc(x)}</li>`).join('')}</ul></div>` : ''}
       <div class="aibox"><div class="row sp"><h4>Siguientes pasos</h4>${((a.siguientes_pasos || []).length + (a.pendientes || []).length) ? `<button class="btn sm" data-act="aiAddAll" data-id="${t.id}">Agregar todo</button>` : ''}</div>${items(a.siguientes_pasos, 'siguiente') || '<div class="muted">—</div>'}</div>
@@ -1197,7 +1247,8 @@ function settingsView() {
     <div class="card" style="margin-bottom:16px"><h3>Qué tickets entran</h3>${inp('keywords', 'Palabras clave del Formulario de Zendesk', 'text', 'Entran los tickets cuyo «Formulario» contenga alguna (separadas por coma): evolutivo, deuda técnica, proyecto.')}
       ${inp('internalDomains', 'Dominios del equipo Inference', 'text', 'Sirve para distinguir quién escribió: cliente o Inference.')}${chk('includeSolved', 'Incluir tickets resueltos al sincronizar')}${chk('autoDates', 'Crear recordatorios solos cuando aparezca una fecha en Zendesk, Slack o en el análisis de IA')}
       ${inp('dateOwner', 'Quién envía las fechas de entrega', 'text', 'Se usa en el Calendario y en los avisos cuando falta una fecha.')}
-      ${chk('autoAI', 'Seguimiento automático con IA: analiza los tickets con novedades, agrega los siguientes pasos y avisa lo que falta')}<div style="width:220px">${inp('aiPerHour', 'Máx. análisis automáticos por hora', 'number', 'Cuida el límite gratuito de la IA.')}</div>
+      ${chk('autoAI', 'IA automática en segundo plano (gasta tokens aunque no la pidas). Recomendado: apagada y usar el botón «Actualizar con IA…»')}<div style="width:220px">${inp('aiPerHour', 'Máx. análisis automáticos por hora', 'number', 'Solo cuenta si dejas la IA automática encendida.')}</div>
+      ${chk('autoClose', 'Cerrar y archivar solos los tickets que ya terminaron: Zendesk resuelto/cerrado y canal de Slack archivado (sin IA, no gasta tokens)')}<div style="width:220px">${inp('autoCloseMin', 'Esperar antes de archivar (minutos)', 'number', '0 = al instante. Da margen por si reabren el ticket.')}</div>
       ${inp('areas', 'Áreas del equipo (separadas por coma)', 'text', 'Aparecen al asignar área a hitos, entregables y tareas.')}${inp('provider', 'Nombre del proveedor (para el Status)', 'text', 'Sale en el encabezado del reporte de Status.')}
       <div class="muted sm" style="margin-top:10px">Formularios detectados: ${C.forms.length ? C.forms.map(f => `<span class="ztag">${esc(f.name)}</span>`).join(' ') : '—'}</div></div>
     <div class="card" style="margin-bottom:16px"><h3>Frecuencia y alertas</h3><div class="row wrap" style="gap:18px;align-items:flex-start"><div style="width:180px">${inp('pollSec', 'Zendesk cada (seg)', 'number')}</div><div style="width:180px">${inp('slackPollSec', 'Slack cada (seg)', 'number')}</div><div style="width:180px">${inp('leadMin', 'Avisar antes (min)', 'number')}</div><div style="width:180px">${inp('staleDays', 'Seguimiento tras (días)', 'number', 'Sin respuesta del cliente')}</div><div style="width:180px">${inp('replyHours', 'Responder en (horas)', 'number', 'Cliente esperando')}</div><div style="width:180px">${inp('dailyTime', 'Update del día a las', 'time')}</div></div>
@@ -1394,6 +1445,7 @@ const DEF_VIEW = () => ({ level: 'proyecto', cols: {}, kpis: DEF_KPIS.slice(), h
 function viewOf(d) {
   const v = d ? (d.view = d.view || DEF_VIEW()) : (S.viewAll = S.viewAll || DEF_VIEW());
   v.cols = v.cols || {}; v.kpis = v.kpis || DEF_KPIS.slice();
+  if (!v.techMig) { v.techMig = 1; const c = v.cols.proyecto; if (Array.isArray(c) && !c.includes('tech')) { const i = c.indexOf('encargados'); c.splice(i >= 0 ? i + 1 : c.length, 0, 'tech'); } }   // columna nueva en vistas ya guardadas
   return v;
 }
 const curDash = () => UI.route.id === 'all' ? null : findDash(UI.route.id);
@@ -1424,14 +1476,15 @@ const PCOLS = [
   ['hitos', 'Hitos', t => itemProg(t, 'hito'), 'num'],
   ['entregables', 'Entregables', t => itemProg(t, 'entregable'), 'num'],
   ['tareas', 'Tareas abiertas', taskProg, 'num'],
-  ['situacion', 'Situación (IA)', t => { const a = t.ai && t.ai.data; return a && a.resumen ? `<span title="${esc(a.resumen)}">${esc(trunc(a.resumen, 130))}</span>${aiFresh(t) ? '' : ' <span class="muted sm" title="Hay novedades sin analizar">·</span>'}` : `<span class="muted">${UI.busy['ai' + t.id] ? 'analizando…' : 'por analizar'}</span>`; }, '', 'max-width:320px'],
+  ['situacion', 'Situación', t => { const sm = sumOf(t); return sm.text ? `<span title="${esc(sm.text)}">${esc(trunc(sm.text, 130))}</span>${sm.src === 'manual' ? ' <span class="muted sm" title="Escrito a mano">✍</span>' : (aiFresh(t) ? '' : ' <span class="muted sm" title="Hay novedades sin analizar">·</span>')}` : `<span class="muted">${UI.busy['ai' + t.id] ? 'analizando…' : 'sin análisis'}</span>`; }, '', 'max-width:320px'],
   ['encargados', 'Encargados', t => respHTML(t), '', 'max-width:200px'],
+  ['tech', 'Responsable técnico', t => techCell(t), '', 'max-width:210px'],
   ['faltan', 'Faltan', t => gapChips(t), '', 'max-width:260px'],
   ['slack', 'Slack', t => t.slackId ? `<span class="muted" title="${esc(t.slackName)}">${ic('hash', 14)}</span>` : '<span class="muted" title="Sin canal vinculado">—</span>'],
   ['flags', 'Alertas', flagsHTML],
   ['act', 'Actividad', t => `<span class="muted sm">${ago(lastActivity(t))}</span>`],
 ];
-const PCOLS_DEF = ['tipo', 'num', 'asunto', 'cliente', 'estado', 'situacion', 'siguiente', 'encargados', 'vence', 'entrega', 'faltan', 'flags'];
+const PCOLS_DEF = ['tipo', 'num', 'asunto', 'cliente', 'estado', 'situacion', 'siguiente', 'encargados', 'tech', 'vence', 'entrega', 'faltan', 'flags'];
 const diasTxt = i => { const n = daysTo(i.end); return n < 0 ? `hace ${-n} d` : n === 0 ? 'hoy' : `en ${n} d`; };
 const ICOLS = [
   ['tipo', 'Tipo', i => tagT(i.t.type)],
@@ -1477,7 +1530,7 @@ function dashView() {
   const itemLevel = v.level !== 'proyecto';
   const bar = `<div class="fbar">${chips}
     ${sel('status', STATUSES.map(s => [s, s]), 'Estado interno')}${sel('client', clients.map(c => [c, c]), 'Cliente')}
-    ${sel('owner', [['cliente', 'Siguiente paso: Cliente'], ['inference', 'Siguiente paso: Inference']], 'Responsable')}${sel('slack', [['linked', 'Con Slack'], ['unlinked', 'Sin Slack']], 'Slack')}
+    ${sel('owner', [['cliente', 'Siguiente paso: Cliente'], ['inference', 'Siguiente paso: Inference']], 'Responsable')}${sel('slack', [['linked', 'Con Slack'], ['unlinked', 'Sin Slack']], 'Slack')}${sel('tech', allTechNames().map(x => [x, x]), 'Resp. técnico')}
     ${itemLevel ? sel('area', allAreas().map(a => [a, a]), 'Área') + sel('who', allWho().map(a => [a, a]), 'Encargado') : ''}
     <label class="row sm"><input type="checkbox" data-ch="dfilter" data-k="attention" ${f.attention ? 'checked' : ''}> Requieren atención</label>
     <input type="text" data-ch="dfilter" data-k="q" placeholder="Buscar #, asunto, cliente…" value="${esc(f.q || '')}"></div>`;
@@ -1529,7 +1582,7 @@ const meName = () => (session() || {}).user || '';
 const inits = n => String(n || '?').split(/[\s._-]+/).filter(Boolean).slice(0, 2).map(x => x[0].toUpperCase()).join('') || '?';
 const prettyUser = u => String(u || '').replace(/[._-]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 /* acciones permitidas al rol «lector» (solo mirar, filtrar y copiar) */
-const VIEW_ACT = new Set(['doLogin', 'logout', 'nav', 'bell', 'alertGo', 'alertsRead', 'openTicket', 'closeTab', 'calNav', 'calType', 'calDay', 'calWho', 'calClear', 'selectDash', 'toggleFolder', 'dfType', 'ttab', 'closeModal', 'refresh', 'refreshOne', 'copyEl', 'dailyCopy', 'dailyCopyHTML', 'archCopy', 'archDl', 'stType', 'stCopy', 'stPrint', 'gz', 'viewLevel', 'viewEdit', 'pendF', 'tplSel', 'tplRegen', 'tplMail', 'testConn', 'askNotif', 'exportData', 'syncNow', 'briefClose', 'copyCred', 'owedF', 'owedCopy', 'owedCopyBy']);
+const VIEW_ACT = new Set(['noop', 'doLogin', 'logout', 'nav', 'bell', 'alertGo', 'alertsRead', 'openTicket', 'closeTab', 'calNav', 'calType', 'calDay', 'calWho', 'calClear', 'selectDash', 'toggleFolder', 'dfType', 'ttab', 'closeModal', 'refresh', 'refreshOne', 'copyEl', 'dailyCopy', 'dailyCopyHTML', 'archCopy', 'archDl', 'stType', 'stCopy', 'stPrint', 'gz', 'viewLevel', 'viewEdit', 'pendF', 'tplSel', 'tplRegen', 'tplMail', 'testConn', 'askNotif', 'exportData', 'syncNow', 'briefClose', 'copyCred', 'owedF', 'owedCopy', 'owedCopyBy']);
 const VIEW_CH = new Set(['dfilter', 'calSel', 'calOpt', 'stSel', 'stChk', 'pendOver', 'dailyScope', 'viewLevel', 'viewCol', 'viewKpi', 'viewHide', 'tplPick', 'tplText', 'extra', 'set', 'setChk', 'owedSel']);
 function roGuard(kind, name) {
   if (canEdit() || (kind === 'act' ? VIEW_ACT : VIEW_CH).has(name)) return true;
@@ -1537,12 +1590,52 @@ function roGuard(kind, name) {
   return false;
 }
 
+/* ---------- accesos: quién ve qué ---------- */
+const canAI = () => canEdit() && (session() || {}).ai !== false;
+const cmp = x => norm(x).replace(/[^a-z0-9]/g, '');
+const myClients = () => { const c = C.me && C.me.clients !== undefined ? C.me.clients : (session() || {}).clients; return Array.isArray(c) && c.length ? c : '*'; };
+const restricted = () => myClients() !== '*';
+const clientOk = c => !restricted() || (!!cmp(c) && myClients().some(a => cmp(a) === cmp(c)));
+const scopeTxt = c => (c === '*' || !c) ? 'Todos los clientes' : (c.length <= 2 ? c.join(', ') : `${c.length} clientes`);
+/* perfiles: con elegir uno (y los clientes, si aplica) queda definido todo el acceso */
+const PROFILES = [
+  ['admin', 'Administrador · todo y gestiona usuarios', { role: 'admin', all: true }],
+  ['ed_all', 'Editor · ve y edita todos los clientes', { role: 'editor', all: true }],
+  ['ed_cli', 'Editor · solo los clientes que elija', { role: 'editor', all: false }],
+  ['lec_all', 'Solo lectura · todos los clientes', { role: 'lector', all: true }],
+  ['lec_cli', 'Solo lectura · solo los clientes que elija', { role: 'lector', all: false }],
+];
+const profileOf = (role, clients) => role === 'admin' ? 'admin' : role === 'lector' ? (clients === '*' ? 'lec_all' : 'lec_cli') : (clients === '*' ? 'ed_all' : 'ed_cli');
+const profDef = id => (PROFILES.find(p => p[0] === id) || PROFILES[1])[2];
+function clientOptions() {
+  const set = new Set(statusClients());
+  C.fields.filter(f => /^cliente\b/.test(norm(f.title))).forEach(f => (f.options || []).forEach(o => set.add(o.name)));
+  (S.archive || []).forEach(a => a.client && set.add(a.client));
+  Object.keys(S.clientCfg || {}).forEach(c => set.add(c));
+  return [...set].filter(Boolean).sort((a, b) => a.localeCompare(b));
+}
+function clientPicker(sel, ch) {
+  const opts = clientOptions();
+  if (!opts.length) return '<div class="muted sm" style="margin-top:8px">Aún no hay clientes cargados: pulsa «Actualizar» para traerlos de Zendesk y vuelve.</div>';
+  return `<div class="muted sm" style="margin:10px 0 4px">Marca los clientes que podrá ver (${sel.length} elegido(s)):</div><div class="vgrid">${opts.map(c => `<label class="row"><input type="checkbox" data-ch="${ch}" data-c="${esc(c)}" ${sel.some(x => cmp(x) === cmp(c)) ? 'checked' : ''}> ${esc(c)}</label>`).join('')}</div>`;
+}
+/* si el administrador reduce mis clientes, lo que ya no puedo ver se quita de este navegador */
+function purgeForbidden() {
+  if (!restricted()) return;
+  for (const [id, t] of Object.entries(S.tickets)) if (!clientOk(t.client)) { delete S.tickets[id]; delete C.comments[id]; delete C.slack[id]; UI.tabs = UI.tabs.filter(x => x !== id); }
+  S.archive = (S.archive || []).filter(a => clientOk(a.client));
+  for (const c of Object.keys(S.clientCfg || {})) if (!clientOk(c)) delete S.clientCfg[c];
+  if (UI.route.v === 'ticket' && !S.tickets[UI.route.id]) UI.route = { v: 'dash', id: 'all' };
+}
+
 /* ---------- equipo, presencia y usuarios ---------- */
-UI.um = { users: [], kv: true, loaded: false, cred: null, err: '' };
+UI.um = { users: [], kv: true, loaded: false, cred: null, err: '', draft: { user: '', profile: 'ed_all', clients: [], ai: true }, edit: null };
 async function loadMe() {
   try {
     const j = await api('/me'); C.me = j;
-    const s = session(); if (s && (s.role !== j.role || s.user !== j.user)) { s.role = j.role; s.user = j.user; localStorage.setItem(SESS, JSON.stringify(s)); }
+    const s = session();
+    if (s && (s.role !== j.role || s.user !== j.user || JSON.stringify(s.clients) !== JSON.stringify(j.clients) || s.ai !== j.ai)) { Object.assign(s, { role: j.role, user: j.user, clients: j.clients, ai: j.ai }); localStorage.setItem(SESS, JSON.stringify(s)); }
+    purgeForbidden(); save();
     softRender();
   } catch (e) { /* Worker antiguo sin /me */ }
 }
@@ -1552,29 +1645,47 @@ async function loadUsers() {
   if (UI.route.v === 'settings') softRender();
 }
 const seenTxt = ts => !ts ? 'nunca' : (Date.now() - ts < 6 * 60000 ? '<span class="online"></span>conectado' : ago(ts));
+function accessModal() {
+  const e = UI.um.edit, pf = profDef(e.profile);
+  openModal(`<div class="row sp"><h2>Accesos de ${esc(prettyUser(e.user))}</h2><button class="btn" data-act="closeModal">Cancelar</button></div>
+    <label class="lb">Perfil</label><select data-ch="umEdit" data-k="profile">${PROFILES.map(p => `<option value="${p[0]}" ${p[0] === e.profile ? 'selected' : ''}>${p[1]}</option>`).join('')}</select>
+    ${pf.role === 'editor' ? `<label class="row" style="margin-top:12px"><input type="checkbox" data-ch="umEdit" data-k="ai" ${e.ai ? 'checked' : ''}> Puede usar la IA (gasta tokens del plan gratuito)</label>` : ''}
+    ${pf.all ? '<div class="muted sm" style="margin-top:12px">Verá todos los clientes, también los que se agreguen después.</div>' : clientPicker(e.clients, 'umEditClient')}
+    <div class="row" style="margin-top:16px;justify-content:flex-end"><button class="btn pri" data-act="userAccessSave">Guardar accesos</button></div>
+    <div class="muted sm" style="margin-top:8px">Aplica de inmediato y lo hace cumplir el Worker: si le quitas un cliente, deja de recibir sus tickets, canales y datos.</div>`);
+}
 function usersCard() {
   const mine = role(), list = (isAdmin() && UI.um.loaded ? UI.um.users : (C.me && C.me.users) || []);
   const kvOk = !(C.health && C.health.kv === false);
   const rows = list.map(u => {
     const edit = isAdmin() && u.src === 'app';
     return `<tr><td><b>${esc(prettyUser(u.user))}</b> <span class="muted sm">${esc(u.user)}</span>${u.user === meName() ? ' <span class="pill p-green">tú</span>' : ''}</td>
-      <td>${edit ? `<select class="mini" data-ch="userRole" data-u="${esc(u.user)}">${['admin', 'editor', 'lector'].map(r => `<option value="${r}" ${u.role === r ? 'selected' : ''}>${ROLE_LABEL[r]}</option>`).join('')}</select>` : `<span class="pill ${u.role === 'admin' ? 'p-inference' : u.role === 'lector' ? 'p-grey' : 'p-green'}">${ROLE_LABEL[u.role] || u.role}</span>`}</td>
+      <td><span class="pill ${u.role === 'admin' ? 'p-inference' : u.role === 'lector' ? 'p-grey' : 'p-green'}">${ROLE_LABEL[u.role] || u.role}</span></td>
+      <td class="sm" title="${esc(Array.isArray(u.clients) ? u.clients.join(', ') : '')}">${u.clients === undefined ? '' : `<span class="pill ${u.clients === '*' ? 'p-grey' : 'p-cliente'}">${esc(scopeTxt(u.clients))}</span>`}</td>
+      <td class="sm">${u.role === 'lector' || u.ai === undefined ? '<span class="muted">—</span>' : u.ai === false ? '<span class="pill p-red">Sin IA</span>' : 'Sí'}</td>
       <td class="muted sm">${u.src === 'env' ? 'Cloudflare' : 'Creado en la web'}</td><td class="sm">${seenTxt(u.seen)}</td>
-      <td style="white-space:nowrap">${edit ? `<button class="btn sm" data-act="userReset" data-u="${esc(u.user)}">Nueva clave</button> <button class="btn sm danger" data-act="userDel" data-u="${esc(u.user)}">${ic('trash', 13)}</button>` : ''}</td></tr>`;
+      <td style="white-space:nowrap">${edit ? `<button class="btn sm" data-act="userAccess" data-u="${esc(u.user)}">${ic('edit', 13)} Accesos</button> <button class="btn sm" data-act="userReset" data-u="${esc(u.user)}">Nueva clave</button> <button class="btn sm danger" data-act="userDel" data-u="${esc(u.user)}">${ic('trash', 13)}</button>` : ''}</td></tr>`;
   }).join('');
-  const cred = UI.um.cred ? `<div class="aibox" style="margin-top:12px"><h4>Credenciales (cópialas ahora: la clave no se vuelve a mostrar)</h4><div>Usuario: <b id="cr_user">${esc(UI.um.cred.user)}</b> · Rol: ${ROLE_LABEL[UI.um.cred.role]}</div><div>Contraseña: <code id="cr_pass">${esc(UI.um.cred.pass)}</code></div><div class="row" style="margin-top:8px"><button class="btn sm" data-act="copyEl" data-el="cr_pass">${ic('copy', 13)} Copiar contraseña</button><button class="btn sm" data-act="copyCred">${ic('copy', 13)} Copiar mensaje para enviarle</button></div></div>` : '';
+  const cred = UI.um.cred ? `<div class="aibox" style="margin-top:12px"><h4>Credenciales (cópialas ahora: la clave no se vuelve a mostrar)</h4><div>Usuario: <b id="cr_user">${esc(UI.um.cred.user)}</b> · Rol: ${ROLE_LABEL[UI.um.cred.role]} · Acceso: ${esc(scopeTxt(UI.um.cred.clients))}</div><div>Contraseña: <code id="cr_pass">${esc(UI.um.cred.pass)}</code></div><div class="row" style="margin-top:8px"><button class="btn sm" data-act="copyEl" data-el="cr_pass">${ic('copy', 13)} Copiar contraseña</button><button class="btn sm" data-act="copyCred">${ic('copy', 13)} Copiar mensaje para enviarle</button></div></div>` : '';
+  const d = UI.um.draft, pf = profDef(d.profile);
+  const create = isAdmin() ? (kvOk ? `<div class="aibox" style="margin-top:12px"><h4>Dar un acceso nuevo (solo 3 datos: usuario, perfil y, si aplica, clientes)</h4>
+      <div class="row wrap"><input type="text" id="um_user" data-ch="umDraft" data-k="user" placeholder="usuario (ej: maria)" value="${esc(d.user)}" style="width:190px">
+        <select data-ch="umDraft" data-k="profile" style="width:330px">${PROFILES.map(p => `<option value="${p[0]}" ${p[0] === d.profile ? 'selected' : ''}>${p[1]}</option>`).join('')}</select>
+        ${pf.role === 'editor' ? `<label class="row sm"><input type="checkbox" data-ch="umDraft" data-k="ai" ${d.ai ? 'checked' : ''}> Puede usar IA</label>` : ''}
+        <button class="btn pri" data-act="userCreate">${ic('plus', 14)} Crear y generar contraseña</button></div>
+      ${pf.all ? '' : clientPicker(d.clients, 'umClient')}</div>` : '<div class="muted sm" style="margin-top:10px">Para crear usuarios desde aquí activa el KV (binding <code>STATE</code>) en el Worker. Mientras tanto usa <code>APP_USER_2</code> o <code>APP_USERS</code> en Cloudflare (acepta <code>"clients":["Cliente A"]</code>).</div>') : '';
   const log = (S.log || []).slice().sort((a, b) => b.at - a.at).slice(0, 20).map(l => `<tr class="${S.tickets[l.tid] ? 'click' : ''}" ${S.tickets[l.tid] ? `data-act="openTicket" data-id="${esc(l.tid)}"` : ''}><td class="muted sm" style="white-space:nowrap">${ago(l.at)}</td><td><b>${esc(l.by === 'IA' ? 'IA' : prettyUser(l.by))}</b></td><td>#${esc(l.tid)} · ${esc(l.txt)}</td></tr>`).join('');
   return `<div class="card" style="margin-bottom:16px"><h3>Equipo y accesos</h3>
-    <div class="muted sm" style="margin:4px 0 10px">Tu rol: <b>${ROLE_LABEL[mine]}</b>. <b>Administrador</b>: todo y crea usuarios · <b>Editor</b>: ve y edita todo, usa la IA · <b>Solo lectura</b>: solo ve.</div>
-    ${list.length ? `<table class="tb"><thead><tr><th>Usuario</th><th>Rol</th><th>Origen</th><th>Último acceso</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="muted">Cargando equipo…</div>'}
+    <div class="muted sm" style="margin:4px 0 10px">Tu rol: <b>${ROLE_LABEL[mine]}</b>${restricted() ? ` · ves solo: <b>${esc(myClients().join(', '))}</b>` : ''}. <b>Administrador</b>: todo y crea usuarios · <b>Editor</b>: ve y edita (la IA se le puede quitar) · <b>Solo lectura</b>: solo ve. A cualquiera se le puede dar <b>todos los clientes</b> o <b>solo algunos</b>; el Worker lo hace cumplir.</div>
+    ${list.length ? `<table class="tb"><thead><tr><th>Usuario</th><th>Rol</th><th>Clientes</th><th>IA</th><th>Origen</th><th>Último acceso</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="muted">Cargando equipo…</div>'}
     ${UI.um.err && isAdmin() ? `<div class="login-err">${esc(UI.um.err)}</div>` : ''}
-    ${isAdmin() ? (kvOk ? `<div class="row wrap" style="margin-top:12px"><input type="text" id="um_user" placeholder="usuario (ej: maria)" style="width:190px"><select id="um_role" style="width:160px"><option value="editor">Editor</option><option value="lector">Solo lectura</option><option value="admin">Administrador</option></select><button class="btn pri" data-act="userCreate">${ic('plus', 14)} Crear y generar contraseña</button></div>` : '<div class="muted sm" style="margin-top:10px">Para crear usuarios desde aquí activa el KV (binding <code>STATE</code>) en el Worker. Mientras tanto usa <code>APP_USER_2</code> o <code>APP_USERS</code> en Cloudflare.</div>') : ''}
+    ${create}
     ${cred}
     <h3 style="margin-top:18px">Actividad reciente del equipo</h3>${log ? `<table class="tb"><tbody>${log}</tbody></table>` : '<div class="muted">Aún no hay cambios registrados. Aparecen cuando alguien edita un ticket y se sincroniza.</div>'}</div>`;
 }
 
 /* ---------- datos compartidos entre usuarios (3-way merge sobre KV) ---------- */
-const SH_T = ['steps', 'reminders', 'plan', 'meetings', 'notes', 'internal', 'deliveryManual', 'dateAsked', 'rep', 'ai', 'slackId', 'slackName', 'slackAuto', 'slackMatch', 'slackManualOff', 'converted'];
+const SH_T = ['steps', 'reminders', 'plan', 'meetings', 'notes', 'internal', 'deliveryManual', 'dateAsked', 'rep', 'ai', 'slackId', 'slackName', 'slackAuto', 'slackMatch', 'slackManualOff', 'converted', 'tech', 'sumManual', 'sig'];
 const SH_TOP = ['folders', 'archive', 'templates', 'clientCfg', 'viewAll'];
 const BASE_K = 'pm_base_v1';
 const SH = { rev: 0, base: null, busy: false, quiet: false, err: '', at: 0, by: '', timer: null };
@@ -1585,7 +1696,7 @@ function merge3(b, l, r, key) {
   if (same(l, r)) return l;
   if (same(l, b)) return r;
   if (same(r, b)) return l;
-  if (key === 'ai' && l && r && typeof l === 'object' && typeof r === 'object') return (l.ts || 0) >= (r.ts || 0) ? l : r;
+  if ((key === 'ai' || key === 'tech' || key === 'sumManual') && l && r && typeof l === 'object' && typeof r === 'object') return (l.ts || 0) >= (r.ts || 0) ? l : r;
   if (Array.isArray(l) && Array.isArray(r)) {
     if ([...l, ...r].every(x => x && typeof x === 'object' && x.id !== undefined)) {
       const mk = a => new Map((Array.isArray(a) ? a : []).map(x => [x.id, x]));
@@ -1653,6 +1764,7 @@ function logChanges(base) {
     if (!same(t.deliveryManual, b.deliveryManual)) parts.push('puso la fecha de entrega');
     if (!same(t.rep, b.rep)) parts.push('actualizó el Status');
     if (parts.length) out.push(mkLog(id, me, parts.join(', ')));
+    if (!same(t.tech && t.tech.name, b.tech && b.tech.name)) out.push(mkLog(id, (t.tech && t.tech.by) || me, `responsable técnico: ${(t.tech && t.tech.name) || 'ninguno'}${t.tech && t.tech.src === 'ia' ? ' (leído por IA)' : t.tech && t.tech.src === 'slack' ? ' (regla sobre Slack)' : ''}`));
     if (ia.length) out.push(mkLog(id, 'IA', `agregó ${ia.length} paso(s) al analizar el ticket`));
   }
   const have = new Set((S.log || []).map(l => l.id));
@@ -1756,7 +1868,7 @@ function autoStatus() {
   return { total: open.length, done: open.length - open.filter(needsAI).length, queued: q.length, hour, max: +S.settings.aiPerHour || 14, wait: Math.max(0, AUTO.next - Date.now()) };
 }
 async function autoTick() {
-  if (!S.settings.autoAI || !configured() || !canEdit() || AUTO.cur || AUTO.batch || UI.route.v === 'login') return;
+  if (!S.settings.autoAI || !configured() || !canAI() || AUTO.cur || AUTO.batch || UI.route.v === 'login') return;
   if (C.health && !C.health.ai) return;
   if (Date.now() < AUTO.next) return;
   AUTO.hist = AUTO.hist.filter(x => Date.now() - x < 3600e3);
@@ -1782,6 +1894,7 @@ async function aiBatch(list) {
   AUTO.batch = { n: 0, of: todo.length }; render();
   for (const t of todo) {
     if (!S.tickets[t.id]) continue;
+    if (AUTO.batch.stop) break;
     try { UI.busy['ai' + t.id] = true; await analyzeCore(t, { auto: true }); AUTO.hist.push(Date.now()); }
     catch (e) { toast(`#${t.id}: ${e.message}`, 'err'); if (e.status === 429) break; }
     finally { UI.busy['ai' + t.id] = false; }
@@ -1821,28 +1934,196 @@ function gapDigest() {
 async function briefAI(list) {
   UI.busy.brief = true; render();
   try {
-    const line = t => { const ns = nextStep(t), w = whoOf(t), dv = deliveryOf(t), a = t.ai && t.ai.data; return `#${t.id} | ${t.type.toUpperCase()} | ${t.client || '-'} | ${statusOf(t)} | ${trunc(a && a.resumen || t.subject, 150)} | siguiente: ${ns ? ns.text + ' (' + OWN[ns.owner] + (ns.due ? ', ' + fmtDue(ns.due) : '') + ')' : 'sin definir'} | encargados: ${w.names.join(', ') || '—'} | entrega: ${dv ? fmtDue(dv.date) : 'sin fecha'} | faltan: ${allGaps(t).join('; ') || '—'}`; };
+    const line = t => { const ns = nextStep(t), w = whoOf(t), dv = deliveryOf(t), a = t.ai && t.ai.data; return `#${t.id} | ${t.type.toUpperCase()} | ${t.client || '-'} | ${statusOf(t)} | ${trunc(sumOf(t).text || t.subject, 150)} | siguiente: ${ns ? ns.text + ' (' + OWN[ns.owner] + (ns.due ? ', ' + fmtDue(ns.due) : '') + ')' : 'sin definir'} | encargados: ${w.names.join(', ') || '—'} | entrega: ${dv ? fmtDue(dv.date) : 'sin fecha'} | faltan: ${allGaps(t).join('; ') || '—'}`; };
     const txt = await ai('Eres el asistente de un Project Manager de Inference Labs9. Con las líneas de sus tickets redacta en español, breve y accionable: 1) «Prioridades de hoy» (máx 5, en orden, con #ticket y por qué), 2) «Riesgos», 3) «Qué hay que pedir o completar» (datos faltantes, a quién). No inventes datos.', `Hoy es ${todayStr()}.\n` + list.slice(0, 40).map(line).join('\n'), { json: false });
     UI.brief = { text: txt.trim(), at: Date.now() };
   } catch (e) { toast('IA: ' + e.message, 'err'); }
   UI.busy.brief = false; render();
 }
+/* ---------- firmas: qué escribió la IA, qué escribió una persona y quién lo dio por bueno ---------- */
+function stampSig(t, k, extra) { t.sig = t.sig || {}; t.sig[k] = { by: meName(), at: Date.now(), ...(extra || {}) }; }
+function sigLine(t, k) { const g = (t.sig || {})[k]; return g && g.by ? `<div class="muted sm" style="margin-top:3px">✍ Fijado por ${esc(prettyUser(g.by))} · ${ago(g.at)}</div>` : ''; }
+function sumOf(t) {
+  const m = t.sumManual;
+  if (m && m.text) return { text: m.text, src: 'manual', by: m.by, at: m.at };
+  const a = t.ai && t.ai.data, tx = a && a.resumen ? String(a.resumen) : '', sg = (t.sig || {}).resumen;
+  if (tx && sg && sg.h === hid(tx)) return { text: tx, src: 'firmado', by: sg.by, at: sg.at };
+  return { text: tx, src: tx ? 'ia' : '', by: 'IA', at: t.ai && t.ai.ts };
+}
+function sumActions(t) {
+  const sm = sumOf(t), ed = canEdit();
+  if (!sm.text) return ed ? `<div style="margin-top:6px"><button class="btn sm" data-act="sumEdit" data-id="${t.id}">${ic('edit', 12)} Escribir el resumen a mano</button></div>` : '';
+  const who = sm.src === 'manual' ? `✍ Editado por <b>${esc(prettyUser(sm.by))}</b> · ${ago(sm.at)}` : sm.src === 'firmado' ? `✓ Firmado por <b>${esc(prettyUser(sm.by))}</b> · ${ago(sm.at)}` : '✦ Redactado por IA · sin firmar';
+  return `<div class="row wrap sm" style="margin-top:6px"><span class="muted">${who}</span>${ed ? `<button class="btn sm" data-act="sumEdit" data-id="${t.id}">${ic('edit', 12)} Editar</button>${sm.src === 'ia' ? `<button class="btn sm" data-act="sumSign" data-id="${t.id}" title="Dar por bueno el texto de la IA">${ic('check', 12)} Firmar</button>` : ''}${sm.src === 'manual' ? `<button class="btn sm" data-act="sumReset" data-id="${t.id}">Volver al texto de la IA</button>` : ''}` : ''}</div>`;
+}
+
+/* ---------- responsable técnico: lectura de Slack (sin IA) ---------- */
+const TECH_STOP = new Set(['equipo', 'cliente', 'clientes', 'todos', 'todas', 'nadie', 'pendiente', 'tbd', 'soporte', 'area', 'proveedor', 'inference', 'la', 'el', 'los', 'las', 'un', 'una', 'por', 'quien', 'alguien', 'definir', 'mi', 'su', 'este', 'esta', 'ese', 'esa', 'ya', 'ahora']);
+const TECH_KW = /responsable(?:\s+t[eé]cnic[oa])?|a cargo|encargad[oa]|se encarga|se hace cargo|asignad[oa] a|lo ve(?![\wáéíóúñ])|lo ver[aá](?![\wáéíóúñ])|lo toma(?![\wáéíóúñ])|lo tomar[aá](?![\wáéíóúñ])|lo lleva(?![\wáéíóúñ])/gi;
+const TECH_NAME = "(@[\\wáéíóúñÁÉÍÓÚÑ.'-]+(?:\\s+[A-ZÁÉÍÓÚÑ][\\wáéíóúñÁÉÍÓÚÑ.'-]*){0,2}|[A-ZÁÉÍÓÚÑ][\\wáéíóúñÁÉÍÓÚÑ.'-]+(?:\\s+(?:(?:de\\s+(?:la\\s+)?|del\\s+)?[A-ZÁÉÍÓÚÑ][\\wáéíóúñÁÉÍÓÚÑ.'-]*)){0,2})";
+const TECH_RX_AFTER = new RegExp('^' + TECH_NAME), TECH_RX_BEFORE = new RegExp(TECH_NAME + '\\s*$');
+const TECH_FILL_A = /^\s*(?:(?:es|ser[aá]|queda|qued[oó]|como|de|del|el|la|nuevo|nueva|ahora|t[eé]cnic[oa])(?![\wáéíóúñ])|[:=\-–—,])\s*/i;
+const TECH_FILL_B = /\s*(?:(?<![\wáéíóúñ])(?:es|ser[aá]|queda|qued[oó]|como|el|la|nuevo|nueva|ahora|se)|[:=\-–—,])\s*$/i;
+function techClean(raw) {
+  let n = String(raw || '').replace(/^@/, '').replace(/[.,;:]+$/, '').trim();
+  const first = norm(n.split(/\s+/)[0]);
+  if (!n || n.length < 2 || TECH_STOP.has(first)) return '';
+  return n;
+}
+/* Busca en los mensajes de Slack quién es nombrado responsable. Devuelve las menciones, la más reciente primero. */
+function techCandidates(t, msgs) {
+  const out = [];
+  for (const m of (msgs || C.slack[t.id] || [])) {
+    const text = String(m.text || '');
+    for (const k of text.matchAll(TECH_KW)) {
+      let after = text.slice(k.index + k[0].length, k.index + k[0].length + 80), before = text.slice(Math.max(0, k.index - 70), k.index), prev;
+      do { prev = after; after = after.replace(TECH_FILL_A, ''); } while (after !== prev);
+      do { prev = before; before = before.replace(TECH_FILL_B, ''); } while (before !== prev);
+      after = after.trimStart(); before = before.trimEnd();
+      const a = after.match(TECH_RX_AFTER), b = before.match(TECH_RX_BEFORE);
+      const name = techClean(a ? a[1] : b ? b[1] : '');
+      if (name) out.push({ name, ts: m.ts, at: m.at, user: m.user, text, kw: k[0] });
+    }
+  }
+  return out.sort((x, y) => parseFloat(y.ts) - parseFloat(x.ts));
+}
+
+const SYS_TECH = `Lees el canal interno de Slack de un proyecto de Inference Labs9 y determinas quién es HOY el RESPONSABLE TÉCNICO: la persona del equipo que ejecuta o implementa el trabajo técnico. Reglas: 1) Gana la asignación EXPLÍCITA más reciente; si alguien dice que ahora lo ve otra persona, esa reemplaza a la anterior aunque la primera aparezca más veces. 2) Quien solo da seguimiento, es PM o comercial, o es del cliente, no es responsable técnico salvo que se le asigne lo técnico. 3) Saludos, «cc», preguntas o menciones sueltas no son asignaciones. 4) Si dos personas comparten el trabajo, devuelve la principal y menciona la otra en "dudas". 5) No inventes: si no hay una asignación clara, deja el nombre vacío con confianza baja. Si el nombre coincide con alguien del EQUIPO, escríbelo como en el EQUIPO. Responde SOLO con un objeto JSON válido.`;
+const techOf = t => t.tech || { name: '' };
+const allTechNames = () => [...new Set(Object.values(S.tickets).map(t => techOf(t).name).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+function setTech(t, name, src, o = {}) {
+  name = String(name || '').trim();
+  const cur = t.tech, now = Date.now();
+  const prev = (cur && cur.name && norm(cur.name) !== norm(name) ? [cur.name, ...(cur.prev || [])] : (cur && cur.prev) || []).filter((x, i, a) => a.indexOf(x) === i).slice(0, 4);
+  if (!name) { t.tech = { name: '', src: '', by: meName(), at: now, ts: now, ev: '', conf: '', basis: '0', prev }; return; }
+  t.tech = { name, src, by: src === 'manual' ? meName() : src === 'ia' ? 'IA' : 'Slack', at: now, ts: now, ev: o.ev || '', conf: o.conf || '', basis: o.basis || t.lastSlackTs || '0', prev };
+  if (cur && cur.name && norm(cur.name) !== norm(name) && src !== 'manual') alertOnce(`tech:${t.id}:${hid(norm(name))}`, t.id, 'avance', `#${t.id} · Responsable técnico: ${name} (antes ${cur.name})${src === 'slack' ? ' · según Slack, sin verificar' : ''}`);
+}
+/* Lectura barata (sin IA) de los mensajes ya cargados. Nunca pisa lo fijado a mano; la IA solo se pisa con mensajes más nuevos que su lectura. */
+function autoTech(t, force) {
+  const x = t.tech;
+  if (!force && x && x.src === 'manual') return false;
+  const c = techCandidates(t); if (!c.length) return false;
+  const best = c[0];
+  if (!force && x && x.src === 'ia' && parseFloat(best.ts) <= parseFloat(x.basis || 0)) return false;
+  if (x && x.name && norm(x.name) === norm(best.name) && x.src !== 'ia') return false;
+  const distinct = new Set(c.map(z => norm(z.name))).size;
+  setTech(t, best.name, 'slack', { ev: `[${fmtTS(best.at)}] ${best.user}: ${trunc(best.text, 170)}`, conf: distinct > 1 ? 'baja' : 'media', basis: best.ts });
+  return true;
+}
+const needsTech = t => !!t.slackId && !(t.tech && t.tech.src === 'manual') && !(t.techTry && parseFloat(t.techTry.basis) >= parseFloat(t.lastSlackTs || 0)) && (!t.tech || !t.tech.name || t.tech.src === 'slack' || parseFloat(t.tech.basis || 0) < parseFloat(t.lastSlackTs || 0));
+/* Lectura cuidadosa con IA: trae más historial del canal y le pasa las frases de asignación + lo más reciente */
+async function techAI(t, { apply = true } = {}) {
+  if (!t.slackId) throw new Error('Este ticket no tiene canal de Slack vinculado');
+  const d = await api('/slack/history?channel=' + encodeURIComponent(t.slackId) + '&limit=250');
+  if (d.missing) throw new Error('No se pudo leer el canal de Slack');
+  const users = d.users || {};
+  const msgs = d.messages.filter(m => !/channel_join|channel_leave/.test(m.subtype)).map(m => ({ ts: m.ts, at: new Date(parseFloat(m.ts) * 1000).toISOString(), user: users[m.user] || m.user || 'bot', text: slackText(m.text, users) }));
+  if (!msgs.length) throw new Error('El canal no tiene mensajes');
+  const KW = /responsab|encarg|a cargo|asign|lo ve\b|lo ver|lo toma|lo lleva|reemplaz|pasa a|desde hoy|t[eé]cnic|desarroll|consultor/i;
+  const keep = new Set(msgs.filter(m => KW.test(m.text)).slice(-30).map(m => m.ts)); msgs.slice(-12).forEach(m => keep.add(m.ts));
+  const lines = msgs.filter(m => keep.has(m.ts)).map(m => `[${fmtTS(m.at)}] ${m.user}: ${m.text.slice(0, 500)}`).join('\n').slice(-7500);
+  const schema = 'Esquema JSON: {"responsable_tecnico":"nombre y apellido, o vacío si no se puede saber","confianza":"alta|media|baja","evidencia":"frase corta del mensaje que lo indica, con su fecha","cambios":[{"nombre":"","fecha":"YYYY-MM-DD","nota":"asignó|reasignó|dejó"}],"dudas":"por qué hay duda, si la hay"}';
+  const o = parseJSON(await ai(SYS_TECH, `Hoy es ${todayStr()}.\nEQUIPO INFERENCE conocido: ${teamNames(t).join(', ') || '(desconocido)'}\nContacto del cliente: ${contactName(t) || '(desconocido)'}\nAgente en Zendesk: ${agentName(t) || '(sin asignar)'}\nResponsable que muestra hoy la web: ${techOf(t).name || '(ninguno)'}\n\n=== MENSAJES DEL CANAL ${t.slackName} (orden cronológico) ===\n${lines}\n\n${schema}`, { tries: 2 }));
+  const basis = msgs[msgs.length - 1].ts, name = String(o.responsable_tecnico || '').trim();
+  const res = { name, conf: String(o.confianza || '').toLowerCase(), ev: String(o.evidencia || '').slice(0, 260), cambios: Array.isArray(o.cambios) ? o.cambios.slice(-5) : [], dudas: String(o.dudas || '').slice(0, 260), basis };
+  if (!name) t.techTry = { basis, at: Date.now() };
+  if (apply && name && !(t.tech && t.tech.src === 'manual')) setTech(t, name, 'ia', { ev: res.ev, conf: res.conf, basis });
+  return res;
+}
+function techCell(t) {
+  const x = t.tech, btn = canEdit() ? `<button class="ibtn" data-act="techEdit" data-id="${t.id}" title="Cambiar, confirmar o releer con IA">${ic('edit', 13)}</button>` : '';
+  if (!x || !x.name) return `<span class="muted">${t.slackId ? 'sin detectar' : '—'}</span>${btn}`;
+  const src = { manual: ['✍', `Fijado por ${prettyUser(x.by)}`], ia: ['✦', 'Leído por IA' + (x.conf ? ' · confianza ' + x.conf : '') + ' · sin confirmar'], slack: ['#', 'Detectado por regla en Slack · sin verificar'] }[x.src] || ['', ''];
+  const warn = x.src !== 'manual' && x.conf === 'baja' ? ' <span class="gap hot" title="Aparecen varios nombres en Slack: confírmalo o relee con IA">¿varios?</span>' : '';
+  return `<div><b>${esc(x.name)}</b> <span class="tbadge" title="${esc(src[1] + (x.ev ? '\n' + x.ev : ''))}">${src[0]}</span>${warn}${btn}</div>${x.prev && x.prev.length ? `<div class="muted sm" title="Anteriores: ${esc(x.prev.join(', '))}">antes: ${esc(x.prev[0])}</div>` : ''}`;
+}
+function techModal(tid) {
+  const t = S.tickets[tid]; if (!t) return;
+  const x = techOf(t), cands = techCandidates(t).slice(0, 8), res = (UI.techRes || {})[tid], busy = UI.busy['tech' + tid];
+  const srcTxt = { manual: `fijado por ${prettyUser(x.by)}`, ia: 'leído por IA, sin confirmar', slack: 'detectado por regla en Slack, sin verificar' }[x.src] || '';
+  openModal(`<div class="row sp"><h2>Responsable técnico · #${esc(tid)}</h2><button class="btn" data-act="closeModal">Cerrar</button></div>
+    <p class="muted sm">${esc(trunc(t.subject, 90))}${t.slackName ? ' · #' + esc(t.slackName) : ' · sin canal de Slack vinculado'}</p>
+    <div class="aibox"><h4>Ahora</h4>${x.name ? `<b>${esc(x.name)}</b> <span class="muted sm">· ${esc(srcTxt)} · ${ago(x.at)}</span>${x.ev ? `<div class="muted sm" style="margin-top:4px">${esc(x.ev)}</div>` : ''}${x.prev && x.prev.length ? `<div class="muted sm">Antes: ${x.prev.map(esc).join(', ')}</div>` : ''}` : '<span class="muted">Sin responsable técnico.</span>'}</div>
+    <label class="lb">Escribirlo a mano (queda firmado con tu nombre)</label>
+    <div class="row"><input type="text" id="tech_name" list="dl_tech" value="${esc(x.name || '')}" placeholder="Nombre y apellido"><datalist id="dl_tech">${teamNames(t).map(n => `<option value="${esc(n)}">`).join('')}</datalist><button class="btn pri" data-act="techSave" data-id="${esc(tid)}">Guardar</button></div>
+    <div class="row wrap" style="margin-top:10px">${x.name && x.src !== 'manual' ? `<button class="btn" data-act="techConfirm" data-id="${esc(tid)}">${ic('check', 14)} Confirmar «${esc(trunc(x.name, 24))}»</button>` : ''}
+      <button class="btn" data-act="techRule" data-id="${esc(tid)}" title="Lee los mensajes ya cargados, sin IA">${ic('refresh', 14)} Releer Slack (sin IA)</button>
+      <button class="btn" data-act="techRead" data-id="${esc(tid)}" title="Trae más historial del canal y lo analiza: 1 llamada de IA" ${!t.slackId || !canAI() || busy ? 'disabled' : ''}>${ic('spark', 14)} ${busy ? 'Leyendo…' : 'Releer con IA (1 llamada)'}</button>
+      ${x.name ? `<button class="btn danger" data-act="techClear" data-id="${esc(tid)}">Dejar vacío</button>` : ''}</div>
+    ${res ? `<div class="aibox" style="margin-top:12px;border-color:#d6e4f2;background:#f8fbfe"><h4>La IA propone</h4>${res.name ? `<b>${esc(res.name)}</b> <span class="muted sm">· confianza ${esc(res.conf || '?')}</span>` : '<span class="muted">No encontró una asignación clara.</span>'}${res.ev ? `<div class="sm" style="margin-top:4px">${esc(res.ev)}</div>` : ''}${res.cambios.length ? `<div class="muted sm" style="margin-top:4px">Cambios: ${res.cambios.map(c => esc(`${c.nombre || '?'} (${c.fecha || '?'} ${c.nota || ''})`)).join(' → ')}</div>` : ''}${res.dudas ? `<div class="sm" style="margin-top:4px;color:var(--amber)">Dudas: ${esc(res.dudas)}</div>` : ''}${res.name ? `<div style="margin-top:8px"><button class="btn sm pri" data-act="techApply" data-id="${esc(tid)}">Usar este (queda como «leído por IA»)</button> <button class="btn sm" data-act="techApply" data-id="${esc(tid)}" data-sign="1">Usar y firmar</button></div>` : ''}</div>` : ''}
+    <h4 style="margin:16px 0 6px">Frases de «responsable / a cargo» en Slack (la más reciente primero)</h4>
+    ${cands.length ? cands.map((c, i) => `<div class="aiitem"><div class="tx"><b>${esc(c.name)}</b> <span class="muted sm">${fmtTS(c.at)} · ${esc(c.user)}</span><div class="sm">${esc(trunc(c.text, 220))}</div></div><button class="btn sm" data-act="techUse" data-id="${esc(tid)}" data-i="${i}">Usar</button></div>`).join('') : '<div class="muted">No hay frases de ese tipo en los últimos mensajes cargados.</div>'}`);
+}
+
+/* ---------- IA bajo demanda: el botón «Actualizar con IA…» ---------- */
+const AI_ACTS = [
+  ['analyze', 'Analizar y actualizar', 'Resumen, siguientes pasos, pendientes, fechas y lo que falta (lee Zendesk + Slack).', 'ticket(s)'],
+  ['tech', 'Responsable técnico', 'Lee el canal de Slack y detecta quién está a cargo hoy, contando reasignaciones. No toca los fijados a mano.', 'ticket(s) con Slack'],
+  ['brief', 'Prioridades de hoy', 'Resumen global: qué atender primero, riesgos y qué pedir.', '1 llamada'],
+  ['owed', 'Cómo subsanar lo pendiente', 'Una sugerencia por cada punto de «Por subsanar».', '1 llamada'],
+  ['daily', 'Redactar el update del día', 'Texto de cierre del día, listo para copiar.', '1 llamada'],
+];
+function currentScope() {
+  const v = UI.route.v;
+  if (v === 'ticket' && S.tickets[UI.route.id]) return { label: `Ticket #${UI.route.id}`, list: [S.tickets[UI.route.id]] };
+  if (v === 'status') return { label: 'Status del cliente', list: statusList().list };
+  if (v === 'owed') return { label: 'Por subsanar (todos los abiertos)', list: Object.values(S.tickets).filter(t => !t.zdClosed) };
+  if (v === 'daily') return { label: 'Update del día', list: dailyRows().map(r => r.t) };
+  const d = curDash(); return { label: d ? d.name : 'Todos los tickets', list: filterTickets(d ? d.filters : UI.fAll) };
+}
+function aiPlan() {
+  const M = UI.aiMenu, all = M.ids.map(id => S.tickets[id]).filter(Boolean).filter(t => !t.zdClosed);
+  const analyze = all.filter(t => hasContent(t) && (M.scope === 'todos' || !aiFresh(t)));
+  const tech = all.filter(t => t.slackId && !(t.tech && t.tech.src === 'manual') && (M.scope === 'todos' || needsTech(t)));
+  const calls = (M.acts.analyze ? analyze.length : 0) + (M.acts.tech ? tech.length : 0) + ['brief', 'owed', 'daily'].filter(k => M.acts[k]).length;
+  return { all, analyze, tech, calls };
+}
+function openAiMenu() {
+  const M = UI.aiMenu, P = aiPlan(), use = C.aiUse && C.aiUse.day === isoDay(new Date()) ? C.aiUse.n : 0;
+  const cnt = k => k === 'analyze' ? ` · ${P.analyze.length} ticket(s)` : k === 'tech' ? ` · ${P.tech.length} ticket(s)` : ' · 1 llamada';
+  const act = a => `<label class="aiact"><input type="checkbox" data-ch="aiMenuAct" data-k="${a[0]}" ${M.acts[a[0]] ? 'checked' : ''}><div><b>${a[1]}</b><span class="muted sm">${cnt(a[0])}</span><div class="muted sm">${a[2]}</div></div></label>`;
+  openModal(`<div class="row sp"><h2>${ic('spark', 18)} Actualizar con IA</h2><button class="btn" data-act="closeModal">Cerrar</button></div>
+    <p class="muted">Alcance: <b>${esc(M.label)}</b> · ${P.all.length} ticket(s) abiertos. La IA hace solo lo que marques aquí; el resto del tiempo está en reposo y no gasta tokens.</p>
+    <div class="row wrap" style="gap:18px"><label class="row"><input type="radio" name="aiscope" data-ch="aiMenuScope" value="novedades" ${M.scope === 'novedades' ? 'checked' : ''}> Solo tickets con novedades</label><label class="row"><input type="radio" name="aiscope" data-ch="aiMenuScope" value="todos" ${M.scope === 'todos' ? 'checked' : ''}> Todos los del alcance</label></div>
+    <div class="stack" style="margin-top:12px">${AI_ACTS.map(act).join('')}</div>
+    <div class="row sp" style="margin-top:16px"><span class="muted sm">≈ <b>${P.calls}</b> llamada(s) a la IA · hoy van ${use}. Si se llega al límite gratuito, se pausa sola y puedes detenerla.</span><div class="row"><button class="btn" data-act="closeModal">Cancelar</button><button class="btn pri" data-act="aiRun" ${P.calls ? '' : 'disabled'}>Ejecutar</button></div></div>`);
+}
+async function aiRun() {
+  const M = UI.aiMenu; if (!M || AUTO.batch) return;
+  const P = aiPlan(); if (!P.calls) return;
+  AUTO.batch = { n: 0, of: P.calls, stop: false };
+  closeModal(); render();
+  const step = async (fn, label) => {
+    if (AUTO.batch.stop) return;
+    try { await fn(); } catch (e) { toast(`${label}: ${e.message}`, 'err'); if (e.status === 429) AUTO.batch.stop = true; }
+    AUTO.batch.n++; save(); softRender(); await sleep(1500);
+  };
+  if (M.acts.analyze) for (const t of P.analyze) { if (!S.tickets[t.id]) continue; UI.busy['ai' + t.id] = true; await step(async () => { await analyzeCore(t, { auto: true }); AUTO.hist.push(Date.now()); }, '#' + t.id); UI.busy['ai' + t.id] = false; }
+  if (M.acts.tech) for (const t of P.tech) { if (!S.tickets[t.id]) continue; UI.busy['tech' + t.id] = true; await step(() => techAI(t, { apply: true }), 'Resp. técnico #' + t.id); UI.busy['tech' + t.id] = false; }
+  if (M.acts.brief) await step(() => briefAI(P.all), 'Prioridades');
+  if (M.acts.owed) await step(() => owedAdvice(), 'Por subsanar');
+  if (M.acts.daily) await step(() => ACT.dailyAI(), 'Update del día');
+  const stopped = AUTO.batch.stop; AUTO.batch = null; save(); render();
+  toast(stopped ? 'IA detenida' : 'Listo: la IA actualizó lo que pediste');
+}
+
 function aiStrip(list) {
-  const a = autoStatus(), on = S.settings.autoAI;
-  const pct = a.total ? Math.round(a.done * 100 / a.total) : 100;
+  const a = autoStatus(), on = S.settings.autoAI, use = C.aiUse && C.aiUse.day === isoDay(new Date()) ? C.aiUse.n : 0, stale = list.filter(needsAI).length;
   return `<div class="aistrip noprint"><div class="row sp wrap"><div class="row wrap" style="gap:10px">${ic('spark', 16)}<b>Asistente IA</b>
-    <span class="pill ${on ? 'p-green' : 'p-grey'}">${on ? 'Seguimiento automático' : 'Automático apagado'}</span>
-    <span class="muted sm">${AUTO.batch ? `Analizando ${AUTO.batch.n}/${AUTO.batch.of}…` : AUTO.cur ? `Analizando #${AUTO.cur}…` : `${a.done} de ${a.total} tickets al día (${pct}%)${a.queued && on ? ` · ${a.queued} en cola` : ''}`}</span>${UI.aiErr && a.queued ? `<span class="muted sm" title="${esc(UI.aiErr)}" style="color:var(--amber)">⚠ ${esc(trunc(UI.aiErr, 60))}</span>` : ''}</div>
-    <div class="row wrap">${canEdit() ? `<button class="btn sm" data-act="aiBatch" ${AUTO.batch ? 'disabled' : ''}>${ic('refresh', 13)} Analizar ahora los pendientes</button>` : ''}<button class="btn sm pri" data-act="briefAI" ${UI.busy.brief || !canEdit() ? 'disabled' : ''}>${ic('spark', 13)} ${UI.busy.brief ? 'Pensando…' : 'Resumen y prioridades'}</button></div></div>
+    <span class="pill ${on ? 'p-green' : 'p-grey'}" title="${on ? 'Analiza en segundo plano y gasta tokens' : 'Solo corre cuando pulsas «Actualizar con IA…»'}">${on ? 'Automática' : 'Bajo demanda'}</span>
+    <span class="muted sm">${AUTO.batch ? `Trabajando ${AUTO.batch.n}/${AUTO.batch.of}…` : AUTO.cur ? `Analizando #${AUTO.cur}…` : `${stale} de ${list.length} con novedades sin analizar`}${on && a.queued ? ` · ${a.queued} en cola` : ''} · IA hoy: ${use}</span>${UI.aiErr && a.queued && on ? `<span class="muted sm" title="${esc(UI.aiErr)}" style="color:var(--amber)">⚠ ${esc(trunc(UI.aiErr, 60))}</span>` : ''}</div>
+    <div class="row wrap">${canAI() ? (AUTO.batch ? `<button class="btn sm danger" data-act="aiStop">${ic('stop', 13)} Detener</button>` : `<button class="btn sm pri" data-act="aiMenu">${ic('spark', 13)} Actualizar con IA…</button>`) : ''}</div></div>
     ${UI.brief ? `<div class="aibox" style="margin:10px 0 0"><div class="row sp"><h4>Prioridades (${ago(UI.brief.at)})</h4><div class="row"><button class="btn sm" data-act="copyEl" data-el="briefTxt">${ic('copy', 13)}</button><button class="btn sm" data-act="briefClose">${ic('x', 13)}</button></div></div><pre class="pre" id="briefTxt">${esc(UI.brief.text)}</pre></div>` : ''}</div>`;
 }
-/* Caja «Seguimiento automático» para la pestaña Seguimiento del ticket */
+/* Caja «Resumen y seguimiento» para la pestaña Seguimiento del ticket */
 function autoBox(t) {
-  const a = t.ai && t.ai.data, g = allGaps(t), fresh = aiFresh(t), busy = UI.busy['ai' + t.id];
+  const sm = sumOf(t), g = allGaps(t), fresh = aiFresh(t), busy = UI.busy['ai' + t.id], on = S.settings.autoAI;
   const log = (S.log || []).filter(l => l.tid === t.id).sort((x, y) => y.at - x.at).slice(0, 5);
-  return `<div class="sec autobox"><div class="row sp"><h3>${ic('spark', 15)} Seguimiento automático</h3><span class="muted sm">${busy ? 'Analizando…' : t.ai ? `Analizado ${ago(t.ai.ts)}${t.ai.auto ? ' (automático)' : ''}${fresh ? '' : ' · hay novedades sin analizar'}` : (S.settings.autoAI ? 'Pendiente en la cola de análisis' : 'Sin analizar')}</span></div>
-    ${a && a.resumen ? `<p style="margin:6px 0">${esc(a.resumen)}</p>` : `<div class="muted" style="margin:6px 0">${busy ? 'La IA está leyendo Zendesk y Slack…' : 'Aún no hay análisis. Se hace solo; también puedes pulsar «Analizar» en el panel derecho.'}</div>`}
-    ${g.length ? `<div class="gapbox"><b>Falta o requiere atención:</b><ul class="clean">${g.map(x => `<li>${esc(x)}</li>`).join('')}</ul></div>` : (a ? '<div class="muted sm">No se detectan faltantes.</div>' : '')}
+  return `<div class="sec autobox"><div class="row sp"><h3>${ic('spark', 15)} Resumen y seguimiento</h3><span class="muted sm">${busy ? 'Analizando…' : t.ai ? `Analizado ${ago(t.ai.ts)}${fresh ? '' : ' · hay novedades sin analizar'}` : (on ? 'Pendiente en la cola de análisis' : 'Sin analizar: la IA corre solo cuando la pides')}</span></div>
+    ${sm.text ? `<p style="margin:6px 0">${esc(sm.text)}</p>` : `<div class="muted" style="margin:6px 0">${busy ? 'La IA está leyendo Zendesk y Slack…' : 'Aún no hay resumen. Pulsa «Analizar ticket» (panel derecho) cuando quieras que la IA lo actualice, o escríbelo tú.'}</div>`}
+    ${sumActions(t)}
+    ${g.length ? `<div class="gapbox"><b>Falta o requiere atención:</b><ul class="clean">${g.map(x => `<li>${esc(x)}</li>`).join('')}</ul></div>` : (sm.text ? '<div class="muted sm">No se detectan faltantes.</div>' : '')}
     ${log.length ? `<div class="muted sm" style="margin-top:8px">Últimos cambios: ${log.map(l => `<b>${esc(l.by === 'IA' ? 'IA' : prettyUser(l.by))}</b> ${esc(l.txt)} (${ago(l.at)})`).join(' · ')}</div>` : ''}</div>`;
 }
 
@@ -1871,7 +2152,7 @@ function owedRows() {
 const owedFiltered = rows => rows.filter(r => (!UI.owed.org || (r.t.client || '—') === UI.owed.org) && (!UI.owed.who || r.who === UI.owed.who) && (!UI.owed.kind || r.kind === UI.owed.kind));
 const owedAdv = r => (C.owedAI || {})[r.key];
 function owedView() {
-  const all = owedRows(), rows = owedFiltered(all), ed = canEdit();
+  const all = owedRows(), rows = owedFiltered(all), ed = canAI();
   const orgs = [...new Set(all.map(r => r.t.client || '—'))].sort(), whos = [...new Set(all.map(r => r.who))].sort();
   const cnt = k => all.filter(r => r.kind === k).length;
   const chip = (v, l, n) => `<button class="chip ${UI.owed.kind === v ? 'on' : ''}" data-act="owedF" data-k="kind" data-v="${v}">${l}${n !== undefined ? ` <b>${n}</b>` : ''}</button>`;
@@ -1906,7 +2187,7 @@ async function owedAdvice() {
   const rows = owedFiltered(owedRows()).slice(0, 40); if (!rows.length) return;
   UI.busy.owed = true; render();
   try {
-    const line = (r, i) => `${i + 1} | #${r.t.id} ${r.t.type.toUpperCase()} | ${r.t.client || '-'} | estado: ${statusOf(r.t)} | contexto: ${trunc((r.t.ai && r.t.ai.data && r.t.ai.data.resumen) || r.t.subject, 140)} | tipo: ${OWED_K[r.kind]} | responsable actual: ${r.who} (${OWN[r.dep] || r.dep}) | ${r.what}${r.due ? ' | vence ' + r.due : ''}`;
+    const line = (r, i) => `${i + 1} | #${r.t.id} ${r.t.type.toUpperCase()} | ${r.t.client || '-'} | estado: ${statusOf(r.t)} | contexto: ${trunc(sumOf(r.t).text || r.t.subject, 140)} | tipo: ${OWED_K[r.kind]} | responsable actual: ${r.who} (${OWN[r.dep] || r.dep}) | ${r.what}${r.due ? ' | vence ' + r.due : ''}`;
     const team = [...new Set(Object.values(S.tickets).flatMap(teamNames))].slice(0, 20).join(', ');
     const txt = await ai('Eres el asistente de un Project Manager de Inference Labs9 (implementaciones y evolutivos sobre Zendesk, Slack y Five9). Para cada punto adeudado indica en UNA frase, en español y accionable, qué hacer exactamente para subsanarlo (a quién pedir qué, qué registrar, qué responder). Si el responsable actual no es el adecuado propón otro del EQUIPO o «Cliente». No inventes datos. Devuelve solo JSON: {"items":[{"n":1,"accion":"...","responsable":"nombre o vacío si el actual es correcto"}]}', `Hoy es ${todayStr()}.\nEQUIPO: ${team || '(desconocido)'}\n\n` + rows.map(line).join('\n'), { json: true });
     const d = parseJSON(txt); C.owedAI = C.owedAI || {};
@@ -1918,12 +2199,12 @@ async function owedAdvice() {
 
 /* ---------- selector rápido de modelo (barra superior) ---------- */
 async function loadAiModels(quiet) {
-  if (!configured() || !canEdit() || (C.health && !C.health.ai)) return;
+  if (!configured() || !canAI() || (C.health && !C.health.ai)) return;
   try { C.aiModels = await api('/ai/models'); save(); render(); if (!quiet) toast(`Modelos: ${C.aiModels.gemini.length} Gemini · ${C.aiModels.groq.length} Groq`); }
   catch (e) { if (!quiet) toast(e.status === 404 ? 'Tu Worker es antiguo: sube el worker.js nuevo para listar modelos.' : e.message, 'err'); }
 }
 function aiPickerHTML() {
-  if (!configured() || !canEdit() || (C.health && !C.health.ai)) return '';
+  if (!configured() || !canAI() || (C.health && !C.health.ai)) return '';
   const s = S.settings, M = C.aiModels, pv = s.aiProvider || 'auto';
   const cur = pv === 'auto' ? 'auto' : pv + '|' + (s[pv + 'Model'] || '');
   const o = (v, l) => `<option value="${esc(v)}" ${v === cur ? 'selected' : ''}>${esc(l)}</option>`;
@@ -1975,7 +2256,7 @@ const ACT = {
   bell: () => { UI.bell = !UI.bell; render(); },
   alertGo: d => { const a = S.notifications.find(x => x.id === d.aid); if (a) a.read = true; save(); UI.bell = false; d.id && S.tickets[d.id] ? go('ticket', d.id) : go(a && a.kind === 'cal' ? 'cal' : 'daily'); },
   alertsRead: () => { S.notifications.forEach(a => a.read = true); save(); render(); },
-  openTicket: d => { $('#modal').innerHTML = ''; go('ticket', d.id); const t = T_(d.id); if (t && canEdit() && S.settings.autoAI && needsAI(t) && !AUTO.cur && !AUTO.batch) analyzeQuiet(t); },
+  openTicket: d => { $('#modal').innerHTML = ''; go('ticket', d.id); const t = T_(d.id); if (t && canAI() && S.settings.autoAI && needsAI(t) && !AUTO.cur && !AUTO.batch) analyzeQuiet(t); },
   calNav: d => { const c = UI.cal, n = +d.n; if (!n) { c.y = new Date().getFullYear(); c.m = new Date().getMonth(); } else { const x = new Date(c.y, c.m + n, 1); c.y = x.getFullYear(); c.m = x.getMonth(); } render(); },
   calType: d => { const c = UI.cal; c.types = c.types.includes(d.t) ? c.types.filter(x => x !== d.t) : [...c.types, d.t]; render(); },
   calDay: d => { const list = calEvents(UI.cal).filter(e => e.date === d.d).sort((a, b) => KORD[a.kind] - KORD[b.kind]); openModal(`<div class="row sp"><h2>${esc(fmtDue(d.d))}</h2><button class="btn" data-act="closeModal">Cerrar</button></div><div style="margin-top:10px">${list.map(evChip).join('')}</div>`); },
@@ -2050,7 +2331,7 @@ const ACT = {
   },
   /* IA */
   analyze: d => analyzeTicket(T_(d.id), d.instr ? ($('#aiInstr') || {}).value : ''),
-  aiState: d => { const t = T_(d.id); t.internal = t.ai.data.estado; save(); render(); },
+  aiState: d => { const t = T_(d.id); t.internal = t.ai.data.estado; stampSig(t, 'estado'); save(); render(); },
   aiAdd: d => { const t = T_(d.id), a = t.ai.data, x = (d.kind === 'siguiente' ? a.siguientes_pasos : a.pendientes)[+d.i]; toast(pushStep(t, d.kind, x, 'IA') ? 'Agregado a Seguimiento' : 'Ya estaba agregado'); save(); render(); },
   aiAddAll: d => { const t = T_(d.id), a = t.ai.data; let n = 0; (a.siguientes_pasos || []).forEach(x => pushStep(t, 'siguiente', x, 'IA') && n++); (a.pendientes || []).forEach(x => pushStep(t, 'pendiente', x, 'IA') && n++); save(); render(); toast(`${n} elemento(s) agregados`); },
   aiRemind: d => { const t = T_(d.id), f = t.ai.data.fechas[+d.i]; if (!validDate(f.fecha)) return toast('La IA no dio una fecha válida', 'err'); t.reminders.push({ id: uid(), text: f.texto, due: `${f.fecha}T${f.hora && /^\d{2}:\d{2}$/.test(f.hora) ? f.hora : '09:00'}`, done: false, source: 'IA' }); save(); render(); toast('Recordatorio creado'); },
@@ -2100,15 +2381,26 @@ const ACT = {
   briefAI: () => { const d = curDash(); briefAI(UI.route.v === 'status' ? statusList().list : filterTickets(d ? d.filters : UI.fAll)); },
   briefClose: () => { UI.brief = null; render(); },
   userCreate: async () => {
-    const u = norm(($('#um_user') || {}).value || '').trim().replace(/\s+/g, '.').replace(/[^a-z0-9._-]/g, ''), r = ($('#um_role') || {}).value || 'editor';
+    const d = UI.um.draft; d.user = ($('#um_user') || {}).value || d.user || '';
+    const u = norm(d.user).trim().replace(/\s+/g, '.').replace(/[^a-z0-9._-]/g, ''), pf = profDef(d.profile);
     if (u.length < 2) return toast('Escribe un usuario (letras y números, mínimo 2)', 'err');
-    const pass = genPass(14);
-    try { await api('/users', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ user: u, password: pass, role: r }) }); UI.um.cred = { user: u, pass, role: r }; await loadUsers(); render(); toast('Usuario creado'); }
-    catch (e) { toast(e.message, 'err'); }
+    if (!pf.all && !d.clients.length) return toast('Marca al menos un cliente, o elige un perfil de «todos los clientes»', 'err');
+    const pass = genPass(14), clients = pf.all ? '*' : d.clients.slice();
+    try {
+      await api('/users', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ user: u, password: pass, role: pf.role, clients, ai: pf.role === 'editor' ? d.ai : true }) });
+      UI.um.cred = { user: u, pass, role: pf.role, clients }; UI.um.draft = { user: '', profile: d.profile, clients: [], ai: true }; await loadUsers(); render(); toast('Usuario creado');
+    } catch (e) { toast(e.message, 'err'); }
+  },
+  userAccess: d => { const u = UI.um.users.find(x => x.user === d.u); if (!u) return; UI.um.edit = { user: u.user, profile: profileOf(u.role, u.clients), clients: Array.isArray(u.clients) ? u.clients.slice() : [], ai: u.ai !== false }; accessModal(); },
+  userAccessSave: async () => {
+    const e = UI.um.edit; if (!e) return; const pf = profDef(e.profile);
+    if (!pf.all && !e.clients.length) return toast('Marca al menos un cliente, o cambia a un perfil de «todos los clientes»', 'err');
+    try { await api('/users', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ user: e.user, role: pf.role, clients: pf.all ? '*' : e.clients, ai: pf.role === 'editor' ? e.ai : true }) }); closeModal(); await loadUsers(); toast('Accesos actualizados'); }
+    catch (er) { toast(er.message, 'err'); }
   },
   userReset: async d => {
     const pass = genPass(14), x = UI.um.users.find(z => z.user === d.u); if (!x || !confirm(`¿Generar una nueva contraseña para ${d.u}? La anterior deja de servir.`)) return;
-    try { await api('/users', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ user: d.u, password: pass, role: x.role }) }); UI.um.cred = { user: d.u, pass, role: x.role }; render(); }
+    try { await api('/users', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ user: d.u, password: pass, role: x.role }) }); UI.um.cred = { user: d.u, pass, role: x.role, clients: x.clients }; render(); }
     catch (e) { toast(e.message, 'err'); }
   },
   userDel: async d => {
@@ -2116,7 +2408,35 @@ const ACT = {
     try { await api('/users/delete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ user: d.u }) }); await loadUsers(); toast('Usuario eliminado'); }
     catch (e) { toast(e.message, 'err'); }
   },
-  copyCred: () => { const c = UI.um.cred; if (c) copy(`Hola, te creé acceso a PM Hub.\nURL: ${location.origin}${location.pathname}\nUsuario: ${c.user}\nContraseña: ${c.pass}\nRol: ${ROLE_LABEL[c.role]}\nTe recomiendo guardarla en tu gestor de contraseñas.`); },
+  copyCred: () => { const c = UI.um.cred; if (c) copy(`Hola, te creé acceso a PM Hub.\nURL: ${location.origin}${location.pathname}\nUsuario: ${c.user}\nContraseña: ${c.pass}\nRol: ${ROLE_LABEL[c.role]}\nAcceso: ${scopeTxt(c.clients)}\nTe recomiendo guardarla en tu gestor de contraseñas.`); },
+  /* v2.0 · IA bajo demanda, responsable técnico, firmas */
+  noop: () => { },
+  aiMenu: () => {
+    const sc = currentScope(), v = UI.route.v;
+    UI.aiMenu = { label: sc.label, ids: sc.list.map(t => t.id), scope: 'novedades', acts: { analyze: v !== 'daily', tech: false, brief: false, owed: v === 'owed', daily: v === 'daily' } };
+    openAiMenu();
+  },
+  aiRun: () => aiRun(),
+  aiStop: () => { if (AUTO.batch) { AUTO.batch.stop = true; toast('Se detendrá al terminar la llamada en curso'); } },
+  finalAI: d => finalAI(d.id),
+  techEdit: d => techModal(d.id),
+  techSave: d => { const t = T_(d.id), v = (($('#tech_name') || {}).value || '').trim(); if (v) setTech(t, v, 'manual', { ev: 'Escrito a mano' }); else setTech(t, '', ''); save(); techModal(d.id); render(); },
+  techConfirm: d => { const t = T_(d.id), x = techOf(t); if (!x.name) return; setTech(t, x.name, 'manual', { ev: x.ev ? 'Confirmado a mano. ' + x.ev : 'Confirmado a mano' }); save(); techModal(d.id); render(); },
+  techClear: d => { setTech(T_(d.id), '', ''); save(); techModal(d.id); render(); },
+  techRule: d => { const t = T_(d.id); if (!techCandidates(t).length) return toast('No hay frases de «responsable» en los mensajes cargados', 'err'); autoTech(t, true); save(); techModal(d.id); render(); },
+  techUse: d => { const t = T_(d.id), c = techCandidates(t)[+d.i]; if (!c) return; setTech(t, c.name, 'manual', { ev: `[${fmtTS(c.at)}] ${c.user}: ${trunc(c.text, 150)}` }); save(); techModal(d.id); render(); },
+  techRead: async d => {
+    const t = T_(d.id); UI.busy['tech' + d.id] = true; techModal(d.id);
+    try { (UI.techRes = UI.techRes || {})[d.id] = await techAI(t, { apply: false }); }
+    catch (e) { toast('IA: ' + e.message, 'err'); }
+    UI.busy['tech' + d.id] = false; techModal(d.id);
+  },
+  techApply: d => { const t = T_(d.id), r = (UI.techRes || {})[d.id]; if (!r || !r.name) return; setTech(t, r.name, d.sign ? 'manual' : 'ia', { ev: (d.sign ? 'Confirmado a mano tras lectura de IA. ' : '') + r.ev, conf: r.conf, basis: r.basis }); delete UI.techRes[d.id]; save(); techModal(d.id); render(); },
+  sumEdit: d => { const t = T_(d.id); openModal(`<h2>Resumen · #${esc(d.id)}</h2><p class="muted sm">Tu texto reemplaza al de la IA en dashboards, Status y reportes, y queda firmado con tu nombre. Si luego la IA vuelve a analizar el ticket, tu texto se conserva.</p><textarea id="sumEditText" style="min-height:170px">${esc(sumOf(t).text)}</textarea><div class="row sp" style="margin-top:12px"><button class="btn" data-act="closeModal">Cancelar</button><button class="btn pri" data-act="sumSave" data-id="${esc(d.id)}">Guardar y firmar</button></div>`); },
+  sumSave: d => { const t = T_(d.id), v = (($('#sumEditText') || {}).value || '').trim(); if (!v) return toast('El resumen no puede quedar vacío; usa «Volver al texto de la IA»', 'err'); t.sumManual = { text: v, by: meName(), at: Date.now(), ts: Date.now() }; closeModal(); save(); render(); },
+  sumSign: d => { const t = T_(d.id); stampSig(t, 'resumen', { h: hid(sumOf(t).text) }); save(); render(); },
+  sumReset: d => { const t = T_(d.id); t.sumManual = { text: '', by: meName(), at: Date.now(), ts: Date.now() }; save(); render(); },
+  stepOk: d => { const st = (T_(d.id).steps || []).find(x => x.id === d.sid); if (st) { st.ok = meName(); save(); render(); } },
   /* v1.5 · status, gantt, vistas, usuarios */
   stType: d => { const s = UI.st; s.types = s.types.includes(d.t) ? s.types.filter(x => x !== d.t) : [...s.types, d.t]; render(); },
   stEdit: () => { UI.st.edit = !UI.st.edit; render(); },
@@ -2156,6 +2476,12 @@ const ACT = {
 };
 
 const CH = {
+  aiMenuAct: el => { UI.aiMenu.acts[el.dataset.k] = el.checked; openAiMenu(); },
+  aiMenuScope: el => { UI.aiMenu.scope = el.value; openAiMenu(); },
+  umDraft: el => { const d = UI.um.draft; d[el.dataset.k] = el.type === 'checkbox' ? el.checked : el.value; if (el.dataset.k === 'profile') render(); },
+  umClient: el => { const d = UI.um.draft; d.clients = el.checked ? [...d.clients, el.dataset.c] : d.clients.filter(x => x !== el.dataset.c); },
+  umEdit: el => { const e = UI.um.edit; e[el.dataset.k] = el.type === 'checkbox' ? el.checked : el.value; if (el.dataset.k === 'profile') accessModal(); },
+  umEditClient: el => { const e = UI.um.edit; e.clients = el.checked ? [...e.clients, el.dataset.c] : e.clients.filter(x => x !== el.dataset.c); },
   aiQuick: el => { const [p, m] = el.value.split('|'); S.settings.aiProvider = p; if (p !== 'auto') S.settings[p + 'Model'] = m || ''; save(); render(); toast(p === 'auto' ? 'IA: automático' : `IA: ${p} · ${m || 'automático'}`); },
   owedSel: el => { UI.owed[el.dataset.k] = el.value; render(); },
   aiProv: el => { S.settings.aiProvider = el.value; save(); render(); if (el.value !== 'auto' && !C.aiModels && canEdit()) ACT.aiModels(); },
@@ -2171,7 +2497,7 @@ const CH = {
   stChk: el => { UI.st.closed = el.checked; render(); },
   planDone: el => { const p = (T_(el.dataset.id).plan || []).find(x => x.id === el.dataset.pid); if (p) p.done = el.checked; save(); render(); },
   planField: el => { const p = (T_(el.dataset.id).plan || []).find(x => x.id === el.dataset.pid); if (p) p[el.dataset.k] = el.value.trim(); save(); render(); },
-  stepField: el => { const s = (T_(el.dataset.id).steps || []).find(x => x.id === el.dataset.sid); if (s) s[el.dataset.k] = el.value.trim(); save(); render(); },
+  stepField: el => { const s = (T_(el.dataset.id).steps || []).find(x => x.id === el.dataset.sid); if (s && !(el.dataset.k === 'text' && !el.value.trim())) s[el.dataset.k] = el.value.trim(); save(); render(); },
   viewLevel: el => { curView().level = el.value; save(); viewEditor(); render(); },
   viewCol: el => { const v = curView(), cur = colsOf(v).slice(); v.cols[v.level] = el.checked ? [...cur, el.dataset.k] : cur.filter(x => x !== el.dataset.k); save(); render(); },
   viewKpi: el => { const v = curView(); v.kpis = el.checked ? [...v.kpis, el.dataset.k] : v.kpis.filter(x => x !== el.dataset.k); save(); render(); },
@@ -2181,7 +2507,7 @@ const CH = {
   calOpt: el => { UI.cal[el.dataset.k] = el.checked; render(); },
   dfilter: el => { const d = UI.route.id === 'all' ? null : findDash(UI.route.id), f = d ? d.filters : UI.fAll; f[el.dataset.k] = el.type === 'checkbox' ? el.checked : el.value; save(); render(); },
   linkSlack: el => { const t = T_(el.dataset.id), c = C.channels.find(x => x.id === el.value); if (!c) return; Object.assign(t, { slackId: c.id, slackName: c.name, slackAuto: false, slackManualOff: false, lastSlackTs: '0' }); save(); render(); refreshSlack(t).then(() => { save(); render(); }).catch(e => toast(e.message, 'err')); },
-  internal: el => { T_(el.dataset.id).internal = el.value; save(); render(); },
+  internal: el => { const t = T_(el.dataset.id); t.internal = el.value; if (el.value) stampSig(t, 'estado'); else if (t.sig && t.sig.estado) t.sig.estado = { by: '', at: Date.now() }; save(); render(); },
   stepDone: el => { const s = T_(el.dataset.id).steps.find(x => x.id === el.dataset.sid); s.done = el.checked; save(); render(); },
   remDone: el => { const r = T_(el.dataset.id).reminders.find(x => x.id === el.dataset.rid); r.done = el.checked; save(); render(); },
   notes: el => { T_(el.dataset.id).notes = el.value; save(); },
