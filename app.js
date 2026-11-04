@@ -886,7 +886,7 @@ function calEvents(f) {
 const REP_STATES = [['En producción', '#2e9e5b'], ['En desarrollo', '#f08c00'], ['En evaluación', '#e6c200'], ['Bloqueado', '#d64545'], ['Cerrado', '#7d8791'], ['Finalizado', '#7a4fd1']];
 const repColor = s => (REP_STATES.find(x => x[0] === s) || [0, '#999'])[1];
 const repOf = t => t.rep = t.rep || { estado: '', area: '', resp: '', hEst: '', hours: {}, sit: '', next: '' };
-const cfgGet = c => S.clientCfg[c] || { bolsa: '', plataforma: '' };
+const cfgGet = c => S.clientCfg[c] || { bolsa: '', plataforma: '', totalEst: '' };
 const cfgOf = c => S.clientCfg[c] = S.clientCfg[c] || { bolsa: '', plataforma: '' };
 const fmtH = n => `${Math.round((+n || 0) * 10) / 10}`.replace('.', ',') + ' h';
 function zdFieldVal(t, re) {
@@ -1263,6 +1263,14 @@ function aiModelCard() {
 }
 
 /* ---------- ajustes ---------- */
+function totalsCard() {
+  if (!isAdmin()) return '';
+  const cl = [...new Set([...statusClients(), ...Object.keys(S.clientCfg || {})])].sort((a, b) => a.localeCompare(b));
+  const calc = c => Object.values(S.tickets).filter(t => norm(t.client) === norm(c) && zdOpen(t)).reduce((a, t) => a + (parseFloat(repHoursEst(t)) || 0), 0);
+  return `<div class="card" style="margin-bottom:16px"><h3>Horas por cliente (solo administrador)</h3>
+    <div class="muted sm" style="margin:4px 0 10px">Fija aquí el «Total horas estimadas de los requerimientos» que aparece al pie del Status de cada cliente y la bolsa mensual. Si dejas el total vacío, se usa la suma de las horas de sus tickets.</div>
+    ${cl.length ? `<table class="tb"><thead><tr><th>Cliente</th><th>Total de requerimientos (h)</th><th>Suma actual de tickets</th><th>Bolsa mensual (h)</th></tr></thead><tbody>${cl.map(c => `<tr><td><b>${esc(c)}</b></td><td><input type="number" step="0.5" min="0" style="width:120px" data-ch="cfgField" data-c="${esc(c)}" data-k="totalEst" value="${esc(cfgGet(c).totalEst)}" placeholder="auto"></td><td class="muted">${fmtH(calc(c))}</td><td><input type="number" step="0.5" min="0" style="width:120px" data-ch="cfgField" data-c="${esc(c)}" data-k="bolsa" value="${esc(cfgGet(c).bolsa)}" placeholder="0"></td></tr>`).join('')}</tbody></table>` : '<div class="muted">Aún no hay clientes cargados.</div>'}</div>`;
+}
 function settingsView() {
   const s = S.settings, h = C.health;
   const inp = (k, label, type = 'text', hint = '') => `<label class="lb">${label}</label><input type="${type}" data-ch="set" data-k="${k}" ${type === 'number' ? 'data-n="1"' : ''} value="${esc(s[k])}">${hint ? `<div class="muted sm" style="margin-top:3px">${hint}</div>` : ''}`;
@@ -1285,6 +1293,7 @@ function settingsView() {
     <div class="card" style="margin-bottom:16px"><h3>Frecuencia y alertas</h3><div class="row wrap" style="gap:18px;align-items:flex-start"><div style="width:180px">${inp('pollSec', 'Zendesk cada (seg)', 'number')}</div><div style="width:180px">${inp('slackPollSec', 'Slack cada (seg)', 'number')}</div><div style="width:180px">${inp('leadMin', 'Avisar antes (min)', 'number')}</div><div style="width:180px">${inp('staleDays', 'Seguimiento tras (días)', 'number', 'Sin respuesta del cliente')}</div><div style="width:180px">${inp('replyHours', 'Responder en (horas)', 'number', 'Cliente esperando')}</div><div style="width:180px">${inp('dailyTime', 'Update del día a las', 'time')}</div></div>
       <div class="row" style="margin-top:12px"><button class="btn" data-act="askNotif">Activar avisos del navegador</button><span class="muted sm">Estado: ${'Notification' in window ? Notification.permission : 'no disponible'}. Los avisos funcionan mientras la pestaña esté abierta (fíjala).</span></div>${inp('myName', 'Tu nombre (firma de plantillas)')}</div>
     ${usersCard()}
+    ${totalsCard()}
     <div class="card" style="margin-bottom:16px"><h3>Datos</h3><div class="row wrap"><button class="btn" data-act="exportData">${ic('down', 14)} Exportar copia</button><label class="btn">${ic('up', 14)} Importar copia<input type="file" accept=".json" style="display:none" data-ch="importData"></label>
       ${chk('syncKV', 'Compartir datos con el equipo (KV)')}<button class="btn" data-act="syncNow">${ic('refresh', 14)} Sincronizar ahora</button></div>
       <div class="muted sm" style="margin-top:8px">${SH.err ? `<span style="color:var(--red)">${esc(SH.err)}</span>` : SH.last ? `Sincronizado ${ago(SH.last)} (versión ${SH.rev}). Lo que tú o tu equipo cambien en pasos, plan, reuniones, notas, status y dashboards se comparte solo.` : 'Aún no se ha sincronizado.'}</div></div>
@@ -1315,7 +1324,9 @@ function statusView() {
   const rows = list.map(t => ({ t, r: repOf(t), d: repDerived(t), est: repEstado(t) }));
   const counts = {}; REP_STATES.forEach(x => counts[x[0]] = 0); rows.forEach(x => counts[x.est]++);
   const used = rows.reduce((a, x) => a + (parseFloat(x.r.hours[m]) || 0), 0);
-  const estTotal = rows.reduce((a, x) => a + (parseFloat(repHoursEst(x.t)) || 0), 0);
+  const estBy = {}; rows.forEach(x => { const c = x.t.client || ''; estBy[c] = (estBy[c] || 0) + (parseFloat(repHoursEst(x.t)) || 0); });
+  const estCalc = Object.values(estBy).reduce((a, b) => a + b, 0);
+  const estTotal = Object.entries(estBy).reduce((a, [c, v]) => { const o = c ? cfgGet(c).totalEst : ''; return a + (o !== '' && o != null && !isNaN(parseFloat(o)) ? parseFloat(o) : v); }, 0);   // el administrador puede fijar el total por cliente en Ajustes
   const one = cl !== '*' && cl !== '__none__';
   const bolsa = one ? (parseFloat(cfgGet(cl).bolsa) || 0) : [...new Set(list.map(t => t.client).filter(Boolean))].reduce((a, c) => a + (parseFloat(cfgGet(c).bolsa) || 0), 0);
   const saldo = bolsa - used;
@@ -1332,7 +1343,7 @@ function statusView() {
     return `<tr><td class="num"><a href="#" data-act="openTicket" data-id="${t.id}"><b>${esc(t.id)}</b></a><div class="muted sm">${t.type.toUpperCase()}</div></td>
       <td>${esc(tplVars(t).asunto)}</td>
       <td>${edit ? txt('area', d.area) : esc(area || '—')}</td>
-      <td style="white-space:nowrap">${edit ? `<span class="st-dot" style="background:${repColor(est)}"></span><select data-ch="repField" data-id="${t.id}" data-k="estado"><option value="">Auto · ${esc(repEstado({ ...t, rep: { ...r, estado: '' } }))}</option>${REP_STATES.map(([n]) => `<option ${r.estado === n ? 'selected' : ''}>${n}</option>`).join('')}</select>` : `<span class="st-dot" style="background:${repColor(est)}"></span>${esc(est)}`}${allGaps(t).length ? `<div class="noprint"><span class="gap" title="${esc(allGaps(t).join(' · '))}">⚠ ${allGaps(t).length} por completar</span></div>` : ''}</td>
+      <td style="white-space:nowrap">${edit || canEdit() ? `<span class="st-dot" style="background:${repColor(est)}"></span><select class="noprint" data-ch="repField" data-id="${t.id}" data-k="estado" title="Cambiar el estado de este requerimiento"><option value="">Auto · ${esc(repEstado({ ...t, rep: { ...r, estado: '' } }))}</option>${REP_STATES.map(([n]) => `<option ${r.estado === n ? 'selected' : ''}>${n}</option>`).join('')}</select><span class="onlyprint">${esc(est)}</span>` : `<span class="st-dot" style="background:${repColor(est)}"></span>${esc(est)}`}${allGaps(t).length ? `<div class="noprint"><span class="gap" title="${esc(allGaps(t).join(' · '))}">⚠ ${allGaps(t).length} por completar</span></div>` : ''}</td>
       <td>${edit ? `<input type="text" data-ch="repField" data-id="${t.id}" data-k="resp" value="${esc(r.resp)}" placeholder="${esc(d.resp)}">` : respHTML(t)}</td>
       <td class="num">${edit ? `<input type="number" step="0.5" min="0" data-ch="repField" data-id="${t.id}" data-k="hEst" value="${esc(r.hEst)}" placeholder="${zh === null ? 'Por definir' : zh}">` : (e === '' ? 'Por definir' : fmtH(e))}</td>
       <td class="num">${edit ? `<input type="number" step="0.5" min="0" data-ch="repHours" data-id="${t.id}" value="${esc(r.hours[m] ?? '')}" placeholder="0">` : fmtH(r.hours[m] || 0)}</td>
@@ -1366,7 +1377,7 @@ function statusView() {
     ${(() => { const gl = list.filter(t => allGaps(t).length); return gl.length ? `<details class="noprint gapdet" style="margin-bottom:12px"><summary><b>Por completar (${gl.length} ticket${gl.length > 1 ? 's' : ''})</b> — datos que faltan para que el reporte esté completo</summary><table class="tb"><tbody>${gl.map(t => `<tr class="click" data-act="openTicket" data-id="${t.id}"><td class="num"><b>#${t.id}</b></td><td>${gapChips(t, 6)}</td></tr>`).join('')}</tbody></table></details>` : ''; })()}
     <div class="st-bar">Seguimiento de requerimientos</div>
     ${rows.length ? `<table class="st-table"><thead><tr><th>N°</th><th>Requerimiento</th><th>Área / Impacto</th><th>Estado</th><th>Responsable de actividades / Dependencia</th><th>Horas estimadas</th><th>Horas utilizadas este mes</th><th>Situación actual</th><th>Próxima acción</th><th class="noprint"></th></tr></thead><tbody>${trs}</tbody></table>` : '<div class="empty">No hay requerimientos para este cliente con estos filtros.</div>'}
-    <div class="st-foot"><div class="st-legend">${REP_STATES.map(([n, c]) => `<span><i class="st-dot" style="background:${c}"></i>${n}</span>`).join('')}</div><div class="st-total">Total horas estimadas de los requerimientos: <b>${fmtH(estTotal)}</b></div></div></div>`;
+    <div class="st-foot"><div class="st-legend">${REP_STATES.map(([n, c]) => `<span><i class="st-dot" style="background:${c}"></i>${n}</span>`).join('')}</div><div class="st-total">Total horas estimadas de los requerimientos: <b>${fmtH(estTotal)}</b>${Math.abs(estTotal - estCalc) > 1e-9 ? ` <span class="muted sm noprint" title="Suma de las horas de los tickets mostrados">(suma de tickets: ${fmtH(estCalc)})</span>` : ''}</div></div></div>`;
 }
 
 /* ================= GANTT + PLAN (dentro del ticket) ================= */
@@ -2533,7 +2544,7 @@ const CH = {
   },
   repField: el => { const r = repOf(T_(el.dataset.id)); r[el.dataset.k] = el.value; save(); render(); },
   repHours: el => { const r = repOf(T_(el.dataset.id)); if (el.value === '') delete r.hours[UI.st.month]; else r.hours[UI.st.month] = parseFloat(el.value) || 0; save(); render(); },
-  cfgField: el => { cfgOf(el.dataset.c)[el.dataset.k] = el.value; save(); render(); },
+  cfgField: el => { if (el.dataset.k === 'totalEst' && !isAdmin()) return toast('Solo el administrador puede cambiar este total', 'err'); cfgOf(el.dataset.c)[el.dataset.k] = el.value; save(); render(); },
   stSel: el => { UI.st[el.dataset.k] = el.value; render(); },
   stChk: el => { UI.st.closed = el.checked; render(); },
   planDone: el => { const p = (T_(el.dataset.id).plan || []).find(x => x.id === el.dataset.pid); if (p) p.done = el.checked; save(); render(); },
