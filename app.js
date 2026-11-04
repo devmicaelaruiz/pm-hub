@@ -4,7 +4,7 @@
    Web estática (GitHub Pages) + proxy Cloudflare Worker (Zendesk, Slack, IA)
    ===================================================================== */
 
-const VERSION = 'v2.0 · accesos por cliente, IA bajo demanda, responsable técnico y cierre automático';
+const VERSION = 'v2.1 · solo tickets abiertos, filtros nuevos y cierre automático';
 
 /* ---------- utilidades ---------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -1050,7 +1050,7 @@ function findDash(id) { for (const f of S.folders) for (const d of f.dashboards)
 const agentsList = () => [...new Set(Object.values(S.tickets).map(t => t.assigneeId).filter(Boolean))].map(id => [String(id), (C.users[id] && C.users[id].name) || 'Agente ' + id]).sort((a, b) => a[1].localeCompare(b[1]));
 const filtersActive = f => !!(f && ((f.types && f.types.length) || f.status || f.client || f.owner || f.slack || f.tech || f.zd || f.agent || f.chan || f.attention || f.q || f.area || f.who));
 const zdOpen = t => !(t.zdClosed || ['solved', 'closed', 'deleted'].includes(t.zdStatus));
-const showTicket = t => !S.settings.purgeClosed || zdOpen(t);   // «solo abiertos»: lo cerrado en Zendesk no se muestra ni cuenta, aunque aún no se haya limpiado
+const showTicket = t => !S.settings.purgeClosed || (zdOpen(t) && statusOf(t) !== 'Cerrado');   // «solo abiertos»: lo cerrado en Zendesk no se muestra ni cuenta, aunque aún no se haya limpiado
 function filterTickets(f) {
   return Object.values(S.tickets).filter(t => {
     if (!showTicket(t)) return false;
