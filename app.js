@@ -96,7 +96,7 @@ function defaults() {
       workerUrl: '', pollSec: 60, slackPollSec: 120,
       keywords: 'evolutivo, deuda técnica, proyecto', internalDomains: 'inferencelabs9.com',
       myName: '', dailyTime: '17:30', staleDays: 2, leadMin: 60, replyHours: 4,
-      notif: true, includeSolved: false, syncKV: true, autoAI: false, autoClose: true, autoCloseSummary: true, autoCloseMin: 10, aiPerHour: 14, aiProvider: 'auto', geminiModel: '', groqModel: '', autoDates: true, dateOwner: 'Giancarlo Guzmán',
+      notif: true, includeSolved: false, syncKV: true, autoAI: false, autoClose: true, purgeClosed: true, autoCloseSummary: true, autoCloseMin: 10, aiPerHour: 14, aiProvider: 'auto', geminiModel: '', groqModel: '', autoDates: true, dateOwner: 'Giancarlo Guzmán',
       areas: 'Tecnología, Operaciones, QA, Proyectos, Comercial, Cliente', provider: 'Inference Labs9',
     },
     folders: [{ id: 'f1', name: 'Mis dashboards', open: true, dashboards: [{ id: 'd1', name: 'Pendientes de respuesta', filters: { types: [], q: '', status: '', client: '', owner: '', slack: '', attention: true } }] }],
@@ -107,6 +107,7 @@ const loadJSON = (k, def) => { try { const v = JSON.parse(localStorage.getItem(k
 let S = (() => { const d = defaults(), s = loadJSON(LS, null); const r = s ? { ...d, ...s, settings: { ...d.settings, ...(s.settings || {}) } } : d; delete r.settings.appKey; return r; })();
 /* v2.0: la IA pasa a ser bajo demanda y el cierre automático se enciende (una sola vez por navegador) */
 if ((S.settings.settingsVer || 0) < 2) { S.settings.autoAI = false; S.settings.autoClose = true; S.settings.autoCloseMin = 10; S.settings.settingsVer = 2; }
+if ((S.settings.settingsVer || 0) < 3) { S.settings.purgeClosed = true; S.settings.settingsVer = 3; }
 let C = { forms: [], fields: [], users: {}, comments: {}, slack: {}, channels: [], workspaceUrl: '', base: '', health: null, ...loadJSON(LC, {}) };
 
 let saveT = null;
@@ -263,7 +264,7 @@ function autoLink() {
     if (t.slackId || t.slackManualOff) continue;
     const used = new Set(Object.values(S.tickets).filter(x => x.slackId).map(x => x.slackId));
     for (const n of ticketNums(t)) {
-      const ch = C.channels.find(c => !used.has(c.id) && chanHasNum(c, n));
+      const ch = C.channels.find(c => !c.archived && !used.has(c.id) && chanHasNum(c, n));
       if (ch) { t.slackId = ch.id; t.slackName = ch.name; t.slackAuto = true; t.slackMatch = n; break; }
     }
   }
@@ -272,7 +273,7 @@ function slackSuggestions(t) {
   const used = new Set(Object.values(S.tickets).filter(x => x.id !== t.id && x.slackId).map(x => x.slackId));
   const cn = norm(t.client);
   const nums = ticketNums(t); const sc = c => { const p = parseChan(c.name) || {}; let s = 0; if (p.type === t.type) s += 1; if (p.client && cn.includes(norm(p.client))) s += 3; if (nums.some(n => chanHasNum(c, n))) s += 9; if (!c.archived) s += 1; return s; };
-  return C.channels.filter(c => !used.has(c.id)).sort((a, b) => sc(b) - sc(a));
+  return C.channels.filter(c => !c.archived && !used.has(c.id)).sort((a, b) => sc(b) - sc(a));
 }
 
 /* ---------- estado derivado ---------- */
@@ -478,13 +479,13 @@ async function syncZendesk() {
     const kws = S.settings.keywords.split(',').map(s => norm(s).trim()).filter(Boolean);
     const forms = C.forms.filter(f => kws.some(k => norm(f.name).includes(k)));
     if (!forms.length) throw new Error('Ningún formulario de Zendesk contiene: ' + S.settings.keywords);
-    const res = await api(`/zd/tickets?forms=${forms.map(f => f.id).join(',')}&solved=${S.settings.includeSolved ? 1 : 0}`);
+    const res = await api(`/zd/tickets?forms=${forms.map(f => f.id).join(',')}&solved=${S.settings.includeSolved && !S.settings.purgeClosed ? 1 : 0}`);
     Object.assign(C.users, res.users || {});
     const first = !Object.keys(S.tickets).length;
     const jobs = [], seen = new Set();
     for (const z of res.tickets) {
       const id = String(z.id); seen.add(id);
-      if (S.gone && S.gone[id]) continue;
+      if (S.gone && S.gone[id]) { if (new Date(z.updated_at).getTime() <= S.gone[id]) continue; delete S.gone[id]; }   // si se reabre después de quitarlo, vuelve a entrar
       const prev = S.tickets[id];
       const t = prev || { id, steps: [], reminders: [], meetings: [], notes: '', ai: null, slackId: '', internal: '', converted: {}, zdSeen: '', lastSlackTs: '0' };
       const formName = (C.forms.find(f => f.id === z.ticket_form_id) || {}).name || '';
@@ -715,28 +716,45 @@ function archiveTicket(tid, o = {}) {
   if (!/^— (Firmado|Cierre automático)/m.test(text)) text = text.replace(/\s+$/, '') + '\n\n' + stamp + '\n';
   S.archive.unshift({ id: tid, subject: t.subject, client: t.client, type: t.type, closedAt: new Date().toISOString(), summary: text, by: o.auto ? 'auto' : meName() });
   (S.gone = S.gone || {})[tid] = Date.now();
-  S.log = (S.log || []).concat(mkLog(tid, o.auto ? 'Sistema' : meName(), o.auto ? 'cerró y archivó el ticket solo (Zendesk cerrado + canal de Slack archivado)' : 'archivó el ticket')).slice(-200);
+  S.log = (S.log || []).concat(mkLog(tid, o.auto ? 'Sistema' : meName(), o.reason === 'purge' ? 'quitó el ticket (cerrado en Zendesk) y archivó sus notas' : o.auto ? 'cerró y archivó el ticket solo (Zendesk cerrado + canal de Slack archivado)' : 'archivó el ticket')).slice(-200);
   delete S.tickets[tid]; delete C.comments[tid]; delete C.slack[tid];
   UI.tabs = UI.tabs.filter(x => x !== tid); if (UI.route.v === 'ticket' && UI.route.id === tid) UI.route = { v: 'dash', id: 'all' };
-  if (o.auto) alertOnce('autoclose:' + tid, '', 'cierre', `#${tid} (${trunc(t.subject, 60)}) se cerró y archivó solo: Zendesk cerrado y canal de Slack archivado. El resumen está en «Archivo de cierres».`);
+  if (o.auto && o.reason !== 'purge') alertOnce('autoclose:' + tid, '', 'cierre', `#${tid} (${trunc(t.subject, 60)}) se cerró y archivó solo: Zendesk cerrado y canal de Slack archivado. El resumen está en «Archivo de cierres».`);
   save();
 }
 /* Zendesk resuelto/cerrado + canal de Slack archivado  →  se archiva solo (sin IA), tras unos minutos de margen */
+const hasManualData = t => !!((t.notes || '').trim() || (t.meetings || []).length || (t.sumManual && t.sumManual.text) || (t.steps || []).some(x => x.by && x.by !== 'IA'));
+/* Quita de la plataforma un ticket que ya no está abierto en Zendesk. Si tiene notas, reuniones o pasos escritos por personas, guarda una ficha en el archivo. */
+function purgeTicket(tid) {
+  const t = S.tickets[tid]; if (!t) return false;
+  if (hasManualData(t)) { archiveTicket(tid, { auto: true, reason: 'purge', text: buildFinalSummary(t, false).replace(/\s+$/, '') + `\n\nQuitado automáticamente: el ticket ya no está abierto en Zendesk (${t.zdStatus}).\n` }); return true; }
+  (S.gone = S.gone || {})[tid] = Date.now();
+  delete S.tickets[tid]; delete C.comments[tid]; delete C.slack[tid];
+  UI.tabs = UI.tabs.filter(x => x !== tid); if (UI.route.v === 'ticket' && UI.route.id === tid) UI.route = { v: 'dash', id: 'all' };
+  return true;
+}
+/* Zendesk resuelto/cerrado/borrado:
+   · con el canal de Slack también archivado  → se archiva con resumen (si «Cerrar solos» está activo)
+   · sin eso                                  → se quita de la plataforma (si «Mostrar solo abiertos» está activo)
+   Todo sin IA y tras unos minutos de margen. */
 function autoCloseCheck() {
-  if (!S.settings.autoClose || !configured() || !canEdit()) return;
-  const wait = Math.max(0, +S.settings.autoCloseMin || 0) * 60000, now = Date.now(), todo = [];
+  if (!configured() || !canEdit()) return;
+  const wait = Math.max(0, +S.settings.autoCloseMin || 0) * 60000, now = Date.now(), arch = [], purge = [];
   for (const t of Object.values(S.tickets)) {
-    const fin = ['solved', 'closed'].includes(t.zdStatus) && t.slackArchivedReal && !UI.busy['close' + t.id];
-    if (!fin) { if (t.closeSeen) delete t.closeSeen; continue; }
+    const zc = !zdOpen(t);
+    const act = !zc || UI.busy['close' + t.id] ? '' : (S.settings.autoClose && t.zdStatus !== 'deleted' && t.slackArchivedReal) ? 'arch' : S.settings.purgeClosed ? 'purge' : '';
+    if (!act) { if (t.closeSeen) delete t.closeSeen; continue; }
     if (!t.closeSeen) t.closeSeen = now;
-    if (now - t.closeSeen >= wait) todo.push(t.id);
+    if (act === 'purge' || now - t.closeSeen >= wait) (act === 'arch' ? arch : purge).push(t.id);   // quitar un cerrado es inmediato; archivar con resumen espera el margen
   }
-  if (!todo.length) return;
-  todo.forEach(id => {
+  if (!arch.length && !purge.length) return;
+  arch.forEach(id => {
     const t = S.tickets[id];
     archiveTicket(id, S.settings.autoCloseSummary === false && t ? { auto: true, text: `# #${t.id} — ${t.subject}\nCliente: ${t.client || '-'} · Tipo: ${TYPES[t.type]} · Cerrado: ${isoDay(new Date())}\nCierre automático: Zendesk «${t.zdStatus}» y canal de Slack archivado.\n\nArchivado sin resumen.` } : { auto: true });
   });
-  softRender();
+  purge.forEach(purgeTicket);
+  if (purge.length) toast(`Se quitaron ${purge.length} ticket(s) que ya no están abiertos en Zendesk`);
+  save(); softRender();
 }
 function closeAndArchive(tid) {
   const t = S.tickets[tid]; if (!t) return;
@@ -1029,14 +1047,22 @@ function entregaCell(t) {
   return `<span ${late ? 'style="color:var(--red);font-weight:600"' : ''}>${fmtDue(dv.date)}</span>`;
 }
 function findDash(id) { for (const f of S.folders) for (const d of f.dashboards) if (d.id === id) return d; return null; }
+const agentsList = () => [...new Set(Object.values(S.tickets).map(t => t.assigneeId).filter(Boolean))].map(id => [String(id), (C.users[id] && C.users[id].name) || 'Agente ' + id]).sort((a, b) => a[1].localeCompare(b[1]));
+const filtersActive = f => !!(f && ((f.types && f.types.length) || f.status || f.client || f.owner || f.slack || f.tech || f.zd || f.agent || f.chan || f.attention || f.q || f.area || f.who));
+const zdOpen = t => !(t.zdClosed || ['solved', 'closed', 'deleted'].includes(t.zdStatus));
+const showTicket = t => !S.settings.purgeClosed || zdOpen(t);   // «solo abiertos»: lo cerrado en Zendesk no se muestra ni cuenta, aunque aún no se haya limpiado
 function filterTickets(f) {
   return Object.values(S.tickets).filter(t => {
+    if (!showTicket(t)) return false;
     if (f.types && f.types.length && !f.types.includes(t.type)) return false;
     if (f.status && statusOf(t) !== f.status) return false;
     if (f.client && norm(t.client) !== norm(f.client)) return false;
     const ns = nextStep(t); if (f.owner && (!ns || ns.owner !== f.owner)) return false;
     if (f.slack === 'linked' && !t.slackId) return false; if (f.slack === 'unlinked' && t.slackId) return false;
     if (f.tech && norm(techOf(t).name) !== norm(f.tech)) return false;
+    if (f.zd && t.zdStatus !== f.zd) return false;
+    if (f.agent && String(t.assigneeId || '') !== f.agent) return false;
+    if (f.chan === 'open' && (!t.slackId || t.slackArchived)) return false; if (f.chan === 'none' && t.slackId) return false;
     if (f.q && !norm(`${t.id} ${t.subject} ${t.client}`).includes(norm(f.q))) return false;
     if (f.attention && !needsAttention(t)) return false;
     return true;
@@ -1241,7 +1267,7 @@ function settingsView() {
   const s = S.settings, h = C.health;
   const inp = (k, label, type = 'text', hint = '') => `<label class="lb">${label}</label><input type="${type}" data-ch="set" data-k="${k}" ${type === 'number' ? 'data-n="1"' : ''} value="${esc(s[k])}">${hint ? `<div class="muted sm" style="margin-top:3px">${hint}</div>` : ''}`;
   const chk = (k, label) => `<label class="row" style="margin-top:10px"><input type="checkbox" data-ch="setChk" data-k="${k}" ${s[k] ? 'checked' : ''}> ${label}</label>`;
-  const unl = C.channels.filter(c => !Object.values(S.tickets).some(t => t.slackId === c.id));
+  const unl = C.channels.filter(c => !c.archived && !Object.values(S.tickets).some(t => t.slackId === c.id));
   return `<div class="page"><h1>Ajustes</h1><p class="lead">Tus notas y pendientes se guardan solo en este navegador. Las llaves de Zendesk, Slack e IA viven en el Worker, no aquí. Versión ${VERSION}.</p>
     <div class="card stack" style="margin-bottom:16px"><h3>Conexión</h3>${inp('workerUrl', 'URL del Worker', 'url', 'Ej: https://pm-hub-proxy.tu-usuario.workers.dev')}
       <div class="muted sm">Sesión iniciada como <b>${esc((session() || {}).user || '')}</b>, vence ${esc(fmtTS((session() || {}).exp))}.</div>
@@ -1251,6 +1277,7 @@ function settingsView() {
       ${inp('internalDomains', 'Dominios del equipo Inference', 'text', 'Sirve para distinguir quién escribió: cliente o Inference.')}${chk('includeSolved', 'Incluir tickets resueltos al sincronizar')}${chk('autoDates', 'Crear recordatorios solos cuando aparezca una fecha en Zendesk, Slack o en el análisis de IA')}
       ${inp('dateOwner', 'Quién envía las fechas de entrega', 'text', 'Se usa en el Calendario y en los avisos cuando falta una fecha.')}
       ${chk('autoAI', 'IA automática en segundo plano (gasta tokens aunque no la pidas). Recomendado: apagada y usar el botón «Actualizar con IA…»')}<div style="width:220px">${inp('aiPerHour', 'Máx. análisis automáticos por hora', 'number', 'Solo cuenta si dejas la IA automática encendida.')}</div>
+      ${chk('purgeClosed', 'Mostrar solo tickets abiertos: quitar de la plataforma los que ya no están abiertos en Zendesk (si tienen notas o reuniones tuyas, se guarda una ficha en el archivo)')}
       ${chk('autoClose', 'Cerrar y archivar solos los tickets que ya terminaron: Zendesk resuelto/cerrado y canal de Slack archivado (sin IA, no gasta tokens)')}${chk('autoCloseSummary', 'Al cerrar solo, generar también el resumen final (sin IA). Si lo desmarcas, solo archiva')}<div style="width:220px">${inp('autoCloseMin', 'Esperar antes de archivar (minutos)', 'number', '0 = al instante. Da margen por si reabren el ticket.')}</div>
       ${inp('areas', 'Áreas del equipo (separadas por coma)', 'text', 'Aparecen al asignar área a hitos, entregables y tareas.')}${inp('provider', 'Nombre del proveedor (para el Status)', 'text', 'Sale en el encabezado del reporte de Status.')}
       <div class="muted sm" style="margin-top:10px">Formularios detectados: ${C.forms.length ? C.forms.map(f => `<span class="ztag">${esc(f.name)}</span>`).join(' ') : '—'}</div></div>
@@ -1523,7 +1550,7 @@ function dashView() {
   const list = filterTickets(f), its = list.flatMap(ticketItems);
   const clients = [...new Set(Object.values(S.tickets).map(t => t.client).filter(Boolean))].sort();
   const tree = `<aside class="tree"><h3><span>Dashboards</span><button class="ibtn" data-act="newFolder" title="Nueva carpeta">${ic('plus', 15)}</button></h3>
-    <div class="tn ${id === 'all' ? 'on' : ''}" data-act="selectDash" data-id="all">${ic('layout', 15)}<span>Todos los tickets</span><span class="c">${Object.keys(S.tickets).length}</span></div>
+    <div class="tn ${id === 'all' ? 'on' : ''}" data-act="selectDash" data-id="all">${ic('layout', 15)}<span>Todos los tickets</span><span class="c">${Object.values(S.tickets).filter(showTicket).length}</span></div>
     ${S.folders.map(fo => `<div class="tn f" data-act="toggleFolder" data-id="${fo.id}"><span class="chev ${fo.open ? '' : 'closed'}">${ic('chev', 14)}</span>${ic('folder', 15)}<span>${esc(fo.name)}</span><span class="acts">
         <button class="ibtn" data-act="newDash" data-id="${fo.id}" title="Nuevo dashboard">${ic('plus', 14)}</button><button class="ibtn" data-act="renFolder" data-id="${fo.id}" title="Renombrar">${ic('edit', 14)}</button><button class="ibtn" data-act="delFolder" data-id="${fo.id}" title="Eliminar">${ic('trash', 14)}</button></span></div>
       ${fo.open ? fo.dashboards.map(da => `<div class="tn d ${id === da.id ? 'on' : ''}" data-act="selectDash" data-id="${da.id}"><span>${esc(da.name)}</span><span class="c">${filterTickets(da.filters).length}</span><span class="acts"><button class="ibtn" data-act="renDash" data-id="${da.id}" title="Renombrar">${ic('edit', 14)}</button><button class="ibtn" data-act="delDash" data-id="${da.id}" title="Eliminar">${ic('trash', 14)}</button></span></div>`).join('') : ''}`).join('')}
@@ -1532,8 +1559,10 @@ function dashView() {
   const sel = (k, opts, ph) => `<select data-ch="dfilter" data-k="${k}"><option value="">${ph}</option>${opts.map(o => `<option value="${esc(o[0])}" ${f[k] === o[0] ? 'selected' : ''}>${esc(o[1])}</option>`).join('')}</select>`;
   const itemLevel = v.level !== 'proyecto';
   const bar = `<div class="fbar">${chips}
-    ${sel('status', STATUSES.map(s => [s, s]), 'Estado interno')}${sel('client', clients.map(c => [c, c]), 'Cliente')}
+    ${sel('status', STATUSES.filter(x => !(S.settings.purgeClosed && x === 'Cerrado')).map(s => [s, s]), 'Estado interno')}${sel('client', clients.map(c => [c, c]), 'Cliente')}
     ${sel('owner', [['cliente', 'Siguiente paso: Cliente'], ['inference', 'Siguiente paso: Inference']], 'Responsable')}${sel('slack', [['linked', 'Con Slack'], ['unlinked', 'Sin Slack']], 'Slack')}${sel('tech', allTechNames().map(x => [x, x]), 'Resp. técnico')}
+    ${sel('zd', [['new', 'Nuevo'], ['open', 'Abierto'], ['pending', 'Pendiente'], ['hold', 'En espera']], 'Estado Zendesk')}${sel('agent', agentsList(), 'Agente Zendesk')}${sel('chan', [['open', 'Con canal abierto'], ['none', 'Sin canal']], 'Canal Slack')}
+    ${filtersActive(f) ? `<button class="btn sm" data-act="dfClear">${ic('x', 12)} Limpiar filtros</button>` : ''}
     ${itemLevel ? sel('area', allAreas().map(a => [a, a]), 'Área') + sel('who', allWho().map(a => [a, a]), 'Encargado') : ''}
     <label class="row sm"><input type="checkbox" data-ch="dfilter" data-k="attention" ${f.attention ? 'checked' : ''}> Requieren atención</label>
     <input type="text" data-ch="dfilter" data-k="q" placeholder="Buscar #, asunto, cliente…" value="${esc(f.q || '')}"></div>`;
@@ -1585,7 +1614,7 @@ const meName = () => (session() || {}).user || '';
 const inits = n => String(n || '?').split(/[\s._-]+/).filter(Boolean).slice(0, 2).map(x => x[0].toUpperCase()).join('') || '?';
 const prettyUser = u => String(u || '').replace(/[._-]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 /* acciones permitidas al rol «lector» (solo mirar, filtrar y copiar) */
-const VIEW_ACT = new Set(['noop', 'doLogin', 'logout', 'nav', 'bell', 'alertGo', 'alertsRead', 'openTicket', 'closeTab', 'calNav', 'calType', 'calDay', 'calWho', 'calClear', 'selectDash', 'toggleFolder', 'dfType', 'ttab', 'closeModal', 'refresh', 'refreshOne', 'copyEl', 'dailyCopy', 'dailyCopyHTML', 'archCopy', 'archDl', 'stType', 'stCopy', 'stPrint', 'gz', 'viewLevel', 'viewEdit', 'pendF', 'tplSel', 'tplRegen', 'tplMail', 'testConn', 'askNotif', 'exportData', 'syncNow', 'briefClose', 'copyCred', 'owedF', 'owedCopy', 'owedCopyBy']);
+const VIEW_ACT = new Set(['dfClear', 'noop', 'doLogin', 'logout', 'nav', 'bell', 'alertGo', 'alertsRead', 'openTicket', 'closeTab', 'calNav', 'calType', 'calDay', 'calWho', 'calClear', 'selectDash', 'toggleFolder', 'dfType', 'ttab', 'closeModal', 'refresh', 'refreshOne', 'copyEl', 'dailyCopy', 'dailyCopyHTML', 'archCopy', 'archDl', 'stType', 'stCopy', 'stPrint', 'gz', 'viewLevel', 'viewEdit', 'pendF', 'tplSel', 'tplRegen', 'tplMail', 'testConn', 'askNotif', 'exportData', 'syncNow', 'briefClose', 'copyCred', 'owedF', 'owedCopy', 'owedCopyBy']);
 const VIEW_CH = new Set(['dfilter', 'calSel', 'calOpt', 'stSel', 'stChk', 'pendOver', 'dailyScope', 'viewLevel', 'viewCol', 'viewKpi', 'viewHide', 'tplPick', 'tplText', 'extra', 'set', 'setChk', 'owedSel']);
 function roGuard(kind, name) {
   if (canEdit() || (kind === 'act' ? VIEW_ACT : VIEW_CH).has(name)) return true;
@@ -2280,6 +2309,7 @@ const ACT = {
   delDash: d => { const x = findDash(d.id); if (confirm(`¿Eliminar el dashboard «${x.name}»?`)) { S.folders.forEach(f => f.dashboards = f.dashboards.filter(y => y.id !== d.id)); if (UI.route.id === d.id) UI.route.id = 'all'; save(); render(); } },
   toggleFolder: d => { const f = S.folders.find(x => x.id === d.id); f.open = !f.open; save(); render(); },
   selectDash: d => { UI.route = { v: 'dash', id: d.id }; render(); },
+  dfClear: () => { const dd = UI.route.id === 'all' ? null : findDash(UI.route.id), f = dd ? dd.filters : UI.fAll; for (const k of Object.keys(f)) f[k] = Array.isArray(f[k]) ? [] : typeof f[k] === 'boolean' ? false : ''; save(); render(); },
   dfType: d => { const dd = UI.route.id === 'all' ? null : findDash(UI.route.id), f = dd ? dd.filters : UI.fAll; f.types = f.types || []; f.types = f.types.includes(d.t) ? f.types.filter(x => x !== d.t) : [...f.types, d.t]; save(); render(); },
   /* ticket */
   ttab: d => { UI.tab[d.id] = d.k; render(); },
