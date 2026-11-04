@@ -297,3 +297,5 @@ ul.clean{margin:4px 0 0;padding-left:18px}ul.clean li{margin:2px 0}
 .aiact:hover{background:#f6f9fc}.aiact input{margin-top:3px}.aiact b{margin-right:4px}
 .tbadge{display:inline-block;font-size:11px;color:var(--muted,#6b7785);cursor:help;margin:0 3px}
 .ro-banner.info{background:#eef5fc;color:#1f4f82;border-bottom-color:#cfe0f2}
+.onlyprint{display:none}
+@media print{.onlyprint{display:inline}}
