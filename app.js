@@ -96,7 +96,7 @@ function defaults() {
       workerUrl: '', pollSec: 60, slackPollSec: 120,
       keywords: 'evolutivo, deuda técnica, proyecto', internalDomains: 'inferencelabs9.com',
       myName: '', dailyTime: '17:30', staleDays: 2, leadMin: 60, replyHours: 4,
-      notif: true, includeSolved: false, syncKV: true, autoAI: false, autoClose: true, autoCloseMin: 10, aiPerHour: 14, aiProvider: 'auto', geminiModel: '', groqModel: '', autoDates: true, dateOwner: 'Giancarlo Guzmán',
+      notif: true, includeSolved: false, syncKV: true, autoAI: false, autoClose: true, autoCloseSummary: true, autoCloseMin: 10, aiPerHour: 14, aiProvider: 'auto', geminiModel: '', groqModel: '', autoDates: true, dateOwner: 'Giancarlo Guzmán',
       areas: 'Tecnología, Operaciones, QA, Proyectos, Comercial, Cliente', provider: 'Inference Labs9',
     },
     folders: [{ id: 'f1', name: 'Mis dashboards', open: true, dashboards: [{ id: 'd1', name: 'Pendientes de respuesta', filters: { types: [], q: '', status: '', client: '', owner: '', slack: '', attention: true } }] }],
@@ -732,7 +732,10 @@ function autoCloseCheck() {
     if (now - t.closeSeen >= wait) todo.push(t.id);
   }
   if (!todo.length) return;
-  todo.forEach(id => archiveTicket(id, { auto: true }));
+  todo.forEach(id => {
+    const t = S.tickets[id];
+    archiveTicket(id, S.settings.autoCloseSummary === false && t ? { auto: true, text: `# #${t.id} — ${t.subject}\nCliente: ${t.client || '-'} · Tipo: ${TYPES[t.type]} · Cerrado: ${isoDay(new Date())}\nCierre automático: Zendesk «${t.zdStatus}» y canal de Slack archivado.\n\nArchivado sin resumen.` } : { auto: true });
+  });
   softRender();
 }
 function closeAndArchive(tid) {
@@ -1049,7 +1052,7 @@ function ticketView(t) {
       ${zdLink(t) ? `<a href="${zdLink(t)}" target="_blank" rel="noopener">${ic('ext', 14)} Abrir en Zendesk</a>` : ''}${slLink(t) ? `<a href="${slLink(t)}" target="_blank" rel="noopener">${ic('hash', 14)} Abrir canal de Slack</a>` : ''}</div>
     <div class="tk"><aside class="tk-left">${propsHTML(t, ru, ag)}</aside>
     <section class="tk-center"><div class="tk-head"><div><h2>${esc(t.subject)}</h2><div class="muted sm">${esc(t.formName || TYPES[t.type])} · creado ${fmtTS(t.createdAt)} · actividad ${ago(lastActivity(t))}</div></div>
-      <div class="row"><button class="btn" data-act="refreshOne" data-id="${t.id}" title="Actualizar este ticket">${ic('refresh', 14)}</button>${t.readyToClose ? `<button class="btn pri" data-act="closeTicket" data-id="${t.id}" ${UI.busy['close' + t.id] ? 'disabled' : ''}>${ic('archive', 14)} ${UI.busy['close' + t.id] ? 'Generando…' : 'Resumen final y archivar'}</button>` : `<button class="btn" data-act="closeTicket" data-id="${t.id}" title="Cerrar y archivar manualmente">${ic('archive', 14)} Archivar</button>`}</div></div>
+      <div class="row"><button class="btn" data-act="refreshOne" data-id="${t.id}" title="Actualizar este ticket">${ic('refresh', 14)}</button><button class="btn" data-act="archiveOnly" data-id="${t.id}" title="Archiva el ticket sin generar resumen">${ic('archive', 14)} Archivar</button><button class="btn pri" data-act="closeTicket" data-id="${t.id}" ${UI.busy['close' + t.id] ? 'disabled' : ''} title="Arma el resumen final para revisarlo y firmarlo antes de archivar">${ic('archive', 14)} ${UI.busy['close' + t.id] ? 'Generando…' : 'Archivar y generar resumen'}</button></div></div>
       <div class="tk-tabs">${T('seg', 'check', 'Seguimiento')}${T('gantt', 'chart', 'Gantt y plan')}${T('conv', 'mail', 'Zendesk')}${T('slack', 'hash', 'Slack')}${T('meet', 'mic', 'Reuniones')}${T('tpl', 'file', 'Plantillas')}</div>
       <div class="tk-body">${body}</div></section>
     <aside class="tk-right">${aiPanel(t)}</aside></div>`;
@@ -1248,7 +1251,7 @@ function settingsView() {
       ${inp('internalDomains', 'Dominios del equipo Inference', 'text', 'Sirve para distinguir quién escribió: cliente o Inference.')}${chk('includeSolved', 'Incluir tickets resueltos al sincronizar')}${chk('autoDates', 'Crear recordatorios solos cuando aparezca una fecha en Zendesk, Slack o en el análisis de IA')}
       ${inp('dateOwner', 'Quién envía las fechas de entrega', 'text', 'Se usa en el Calendario y en los avisos cuando falta una fecha.')}
       ${chk('autoAI', 'IA automática en segundo plano (gasta tokens aunque no la pidas). Recomendado: apagada y usar el botón «Actualizar con IA…»')}<div style="width:220px">${inp('aiPerHour', 'Máx. análisis automáticos por hora', 'number', 'Solo cuenta si dejas la IA automática encendida.')}</div>
-      ${chk('autoClose', 'Cerrar y archivar solos los tickets que ya terminaron: Zendesk resuelto/cerrado y canal de Slack archivado (sin IA, no gasta tokens)')}<div style="width:220px">${inp('autoCloseMin', 'Esperar antes de archivar (minutos)', 'number', '0 = al instante. Da margen por si reabren el ticket.')}</div>
+      ${chk('autoClose', 'Cerrar y archivar solos los tickets que ya terminaron: Zendesk resuelto/cerrado y canal de Slack archivado (sin IA, no gasta tokens)')}${chk('autoCloseSummary', 'Al cerrar solo, generar también el resumen final (sin IA). Si lo desmarcas, solo archiva')}<div style="width:220px">${inp('autoCloseMin', 'Esperar antes de archivar (minutos)', 'number', '0 = al instante. Da margen por si reabren el ticket.')}</div>
       ${inp('areas', 'Áreas del equipo (separadas por coma)', 'text', 'Aparecen al asignar área a hitos, entregables y tareas.')}${inp('provider', 'Nombre del proveedor (para el Status)', 'text', 'Sale en el encabezado del reporte de Status.')}
       <div class="muted sm" style="margin-top:10px">Formularios detectados: ${C.forms.length ? C.forms.map(f => `<span class="ztag">${esc(f.name)}</span>`).join(' ') : '—'}</div></div>
     <div class="card" style="margin-bottom:16px"><h3>Frecuencia y alertas</h3><div class="row wrap" style="gap:18px;align-items:flex-start"><div style="width:180px">${inp('pollSec', 'Zendesk cada (seg)', 'number')}</div><div style="width:180px">${inp('slackPollSec', 'Slack cada (seg)', 'number')}</div><div style="width:180px">${inp('leadMin', 'Avisar antes (min)', 'number')}</div><div style="width:180px">${inp('staleDays', 'Seguimiento tras (días)', 'number', 'Sin respuesta del cliente')}</div><div style="width:180px">${inp('replyHours', 'Responder en (horas)', 'number', 'Cliente esperando')}</div><div style="width:180px">${inp('dailyTime', 'Update del día a las', 'time')}</div></div>
@@ -2283,6 +2286,12 @@ const ACT = {
   unlinkSlack: d => { const t = T_(d.id); t.slackId = ''; t.slackName = ''; t.slackManualOff = true; t.lastSlackTs = '0'; delete C.slack[d.id]; save(); render(); },
   closeTicket: d => { const t = T_(d.id); if (t.readyToClose || confirm('Este ticket no figura como cerrado. ¿Generar resumen final y archivarlo de todas formas?')) closeAndArchive(d.id); },
   confirmArchive: d => confirmArchive(d.id),
+  archiveOnly: d => {
+    const t = T_(d.id); if (!t) return;
+    if (!confirm(`¿Archivar #${d.id} sin generar resumen? Se borrarán del navegador sus pendientes, reuniones, notas y mensajes.`)) return;
+    archiveTicket(d.id, { text: `# #${t.id} — ${t.subject}\nCliente: ${t.client || '-'} · Tipo: ${TYPES[t.type]} · Archivado: ${isoDay(new Date())}\n\nArchivado sin resumen.` });
+    render(); toast(`#${d.id} archivado`);
+  },
   closeModal: () => closeModal(),
   addStep: d => {
     const t = T_(d.id), text = $('#ns_text').value.trim(); if (!text) return toast('Escribe la descripción', 'err');
