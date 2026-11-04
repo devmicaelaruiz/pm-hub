@@ -293,4 +293,7 @@ ul.clean{margin:4px 0 0;padding-left:18px}ul.clean li{margin:2px 0}
 .late{color:var(--red);font-weight:600}
 
 .aipick{display:inline-flex;align-items:center;gap:4px;margin-right:12px;color:var(--muted)}
-.aipick select{max-width:190px;padding:3px 6px;font-size:12.5px;height:auto}
+.aipick select{max-width:190px;padding:3px 6px;font-size:12.5px;height:auto}.aiact{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:1px solid var(--line,#e3e8ee);border-radius:8px;cursor:pointer}
+.aiact:hover{background:#f6f9fc}.aiact input{margin-top:3px}.aiact b{margin-right:4px}
+.tbadge{display:inline-block;font-size:11px;color:var(--muted,#6b7785);cursor:help;margin:0 3px}
+.ro-banner.info{background:#eef5fc;color:#1f4f82;border-bottom-color:#cfe0f2}
