@@ -497,7 +497,7 @@ async function syncZendesk() {
       else if (t.zdSeen !== z.updated_at || !C.comments[id]) jobs.push([id, true]);
       if (t.zdClosed && ['open', 'new', 'pending', 'hold'].includes(z.status)) { t.zdClosed = false; t.readyToClose = !!t.slackArchived; }
     }
-    for (const id of Object.keys(S.tickets)) if (!seen.has(id) && !S.tickets[id].readyToClose) jobs.push([id, true]);
+    for (const id of Object.keys(S.tickets)) if (!seen.has(id) && !S.tickets[id].zdClosed) jobs.push([id, true]);   // v2.0: un ticket que ya salió de la lista (resuelto) se consulta aunque su Slack ya esté archivado, para que el cierre automático lo detecte
     await pool(jobs, 3, ([id, notify]) => refreshTicket(id, notify));
     S.lastSync = Date.now(); setSync('', '');
   } catch (e) { setSync('', 'Zendesk: ' + e.message); }
